@@ -12,15 +12,14 @@ let GLOBAL_NEXT_PID = 1;
 export class Kernel {
   constructor({ tickMs = 50 } = {}) {
     this.tickMs = tickMs;
-    this.time = 0; // logical time
+    this.time = 0;
     this.processes = [];
-    this.mailboxes = new Map(); // pid -> messages
-    this.vfs = new Map(); // path -> string
-    this.programs = new Map(); // name -> generator factory
-    this.ports = new Map(); // portKey -> { ownerPid, queue: [] }
+    this.mailboxes = new Map();
+    this.vfs = new Map();
+    this.programs = new Map();
+    this.ports = new Map();
     this.logs = [];
 
-    // load VFS from localStorage if available
     this._loadVfsFromStorage();
     if (!this.vfs.has("/etc/motd")) {
       this.vfs.set("/etc/motd", "Benvenuto nel mini-kernel in JS!\n");
@@ -72,7 +71,7 @@ export class Kernel {
       iterator,
       state: ProcessState.READY,
       wakeTime: null,
-      blockReason: null, // "sleep", "recv", "recv_port"
+      blockReason: null,
       waitFrom: null,
       waitPort: null,
       waitTimeoutAt: null,
@@ -84,7 +83,6 @@ export class Kernel {
       spawnTime: now,
     };
 
-    // preallocate stdin/out/err
     pcb.fdTable.set(0, { type: "stdin" });
     pcb.fdTable.set(1, { type: "stdout" });
     pcb.fdTable.set(2, { type: "stderr" });
@@ -112,6 +110,7 @@ export class Kernel {
       read: (fd, n = null) => ({ type: "READ", fd, n }),
       write: (fd, data) => ({ type: "WRITE", fd, data }),
       close: (fd) => ({ type: "CLOSE", fd }),
+      unlink: (path) => ({ type: "UNLINK", path }),
 
       // process control
       exec: (programName, args = []) => ({
@@ -204,7 +203,7 @@ export class Kernel {
         pcb.blockReason = null;
         pcb.waitPort = null;
         pcb.waitTimeoutAt = null;
-        pcb.lastSyscallResult = null; // timeout
+        pcb.lastSyscallResult = null;
       }
     }
 
@@ -434,6 +433,16 @@ export class Kernel {
         pcb.fdTable.delete(req.fd);
         pcb.state = ProcessState.READY;
         return 0;
+      }
+
+      case "UNLINK": {
+        const path = req.path;
+        const existed = this.vfs.delete(path);
+        if (existed) {
+          this._saveVfsToStorage();
+        }
+        pcb.state = ProcessState.READY;
+        return existed;
       }
 
       // process control
@@ -673,7 +682,7 @@ export class Kernel {
 
 // ----------------------------------------------------------
 // Programs: echo server/client, shell, ps, ls, netstat, help,
-// kill, cat
+// kill, cat, echo-file, rm
 // ----------------------------------------------------------
 
 export function* echoServer(sys, port) {
@@ -685,7 +694,7 @@ export function* echoServer(sys, port) {
   yield sys.log(`Echo server listening on port ${port}`);
 
   while (true) {
-    const msg = yield sys.recvFromPort(port); // blocks
+    const msg = yield sys.recvFromPort(port);
     if (!msg) continue;
     const { fromPid, payload } = msg;
     yield sys.log(
@@ -716,7 +725,7 @@ export function* echoClient(sys, port, message) {
   yield sys.exit(0);
 }
 
-// Shell listening on port 9999
+// Shell on port 9999
 export function* shellProcess(sys) {
   const PORT = 9999;
   const ok = yield sys.listen(PORT);
@@ -794,7 +803,6 @@ export function* netstatProgram(sys) {
 
 // help
 export function* helpProgram(sys) {
-  yield sys.log("=== help ===");
   yield sys.log("Available commands:");
   yield sys.log("  echo-client <port> <msg>   - send message to a server");
   yield sys.log("  echo-server <port>        - start echo server on port");
@@ -802,7 +810,10 @@ export function* helpProgram(sys) {
   yield sys.log("  ls                        - list virtual file system");
   yield sys.log("  netstat                   - show open ports");
   yield sys.log("  cat <path>                - print file contents");
+  yield sys.log("  echo-file <path> <text>   - write text to a file");
+  yield sys.log("  rm <path>                 - remove a file");
   yield sys.log("  kill <pid> [SIGNAL]       - terminate a process");
+  yield sys.log("  help                      - this help");
   yield sys.exit(0);
 }
 
@@ -855,4 +866,41 @@ export function* catProgram(sys, path) {
 
   yield sys.close(fd);
   yield sys.exit(0);
+}
+
+// echo-file: write text to a file
+export function* echoFileProgram(sys, path, ...rest) {
+  if (!path) {
+    yield sys.log("Usage: echo-file <path> <text...>");
+    yield sys.exit(1);
+  }
+
+  const text = rest.join(" ");
+  const fd = yield sys.open(path, "w");
+  if (fd < 0) {
+    yield sys.log(`echo-file: cannot open ${path} for writing`);
+    yield sys.exit(1);
+  }
+
+  yield sys.write(fd, text + "\n");
+  yield sys.close(fd);
+  yield sys.log(`echo-file: wrote ${text.length} chars to ${path}`);
+  yield sys.exit(0);
+}
+
+// rm: remove a file
+export function* rmProgram(sys, path) {
+  if (!path) {
+    yield sys.log("Usage: rm <path>");
+    yield sys.exit(1);
+  }
+
+  const ok = yield sys.unlink(path);
+  if (ok) {
+    yield sys.log(`rm: removed ${path}`);
+    yield sys.exit(0);
+  } else {
+    yield sys.log(`rm: ${path}: no such file`);
+    yield sys.exit(1);
+  }
 }
