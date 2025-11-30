@@ -51,16 +51,3 @@ https://arabafenice599rae.github.io/Browser-virtual-kernel/
   - Live kernel log
   - Dark / light theme toggle
 
----
-
-## 🚀 Quick start
-
-### Online (GitHub Pages)
-
-1. Open the demo in your browser:  
-   https://arabafenice599rae.github.io/Browser-virtual-kernel/
-2. Click **“Start Kernel”**.
-3. Type commands into the shell (see list below).
-
-
-
