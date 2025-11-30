@@ -1,648 +1,61 @@
-// kernel.js
+// kernel.js - Browser Virtual Kernel (full version)
 
-export const ProcessState = Object.freeze({
+// ------------------ Process & kernel core ------------------
+
+export const ProcessState = {
   READY: "READY",
   RUNNING: "RUNNING",
   BLOCKED: "BLOCKED",
   TERMINATED: "TERMINATED",
-});
+};
 
-let GLOBAL_NEXT_PID = 1;
+let KERNEL_INSTANCE_COUNTER = 0;
 
 export class Kernel {
   constructor({ tickMs = 50 } = {}) {
+    this.id = ++KERNEL_INSTANCE_COUNTER;
     this.tickMs = tickMs;
-    this.time = 0;
+    this.timeMs = 0;
+
     this.processes = [];
-    this.mailboxes = new Map();
-    this.vfs = new Map();
-    this.programs = new Map();
-    this.ports = new Map();
+    this.nextPid = 1;
+
     this.logs = [];
 
-    this._loadVfsFromStorage();
+    this.mailbox = new Map(); // pid -> [{fromPid, payload}]
+    this.ports = new Map();   // port -> { ownerPid, queue: [{fromPid, payload}] }
+
+    this.programRegistry = new Map();
+
+    this.vfs = new Map();
+    this._restoreVfsFromStorage();
     if (!this.vfs.has("/etc/motd")) {
-      this.vfs.set("/etc/motd", "Benvenuto nel mini-kernel in JS!\n");
+      this._writeFile("/etc/motd", "Benvenuto nel mini-kernel in JS!");
     }
   }
 
-  // -------- VFS persistence --------
+  // ---------- Public API for UI ----------
 
-  _saveVfsToStorage() {
-    try {
-      if (typeof localStorage === "undefined") return;
-      const obj = Object.fromEntries(this.vfs.entries());
-      localStorage.setItem("bvkernel_vfs", JSON.stringify(obj));
-    } catch (e) {
-      console.warn("VFS save failed:", e);
+  registerProgram(name, fn) {
+    this.programRegistry.set(name, fn);
+  }
+
+  spawn(program, opts = {}) {
+    return this._spawnInternal(program, opts);
+  }
+
+  tick() {
+    this.timeMs += this.tickMs;
+    for (const pcb of this.processes) {
+      if (pcb.state === ProcessState.READY || pcb.state === ProcessState.RUNNING) {
+        this._runProcess(pcb);
+      }
     }
-  }
-
-  _loadVfsFromStorage() {
-    try {
-      if (typeof localStorage === "undefined") return;
-      const raw = localStorage.getItem("bvkernel_vfs");
-      if (!raw) return;
-      const obj = JSON.parse(raw);
-      this.vfs = new Map(Object.entries(obj));
-    } catch (e) {
-      console.warn("VFS load failed:", e);
-    }
-  }
-
-  // ---------- Program registration ----------
-
-  registerProgram(name, generatorFactory) {
-    this.programs.set(name, generatorFactory);
-  }
-
-  // ---------- Process management ----------
-
-  spawn(programFactory, { name = "proc", priority = 1, args = [] } = {}) {
-    const pid = GLOBAL_NEXT_PID++;
-    const sys = this._createSyscalls(pid);
-    const iterator = programFactory(sys, ...(args || []));
-    const now = Date.now();
-
-    const pcb = {
-      pid,
-      name,
-      priority,
-      iterator,
-      state: ProcessState.READY,
-      wakeTime: null,
-      blockReason: null,
-      waitFrom: null,
-      waitPort: null,
-      waitTimeoutAt: null,
-      lastSyscallResult: undefined,
-      exitCode: null,
-      fdTable: new Map(),
-      nextFd: 3,
-      heap: {},
-      spawnTime: now,
-    };
-
-    pcb.fdTable.set(0, { type: "stdin" });
-    pcb.fdTable.set(1, { type: "stdout" });
-    pcb.fdTable.set(2, { type: "stderr" });
-
-    this.processes.push(pcb);
-    this.mailboxes.set(pid, []);
-    return pid;
-  }
-
-  _createSyscalls(pid) {
-    return {
-      // time / scheduling
-      sleep: (ms) => ({ type: "SLEEP", ms }),
-
-      // IPC pid-to-pid
-      recv: (from = null) => ({ type: "RECV", from }),
-      send: (to, message) => ({ type: "SEND", to, message }),
-
-      // info / log
-      getPid: () => ({ type: "GETPID" }),
-      log: (msg) => ({ type: "LOG", msg }),
-
-      // VFS
-      open: (path, mode = "r") => ({ type: "OPEN", path, mode }),
-      read: (fd, n = null) => ({ type: "READ", fd, n }),
-      write: (fd, data) => ({ type: "WRITE", fd, data }),
-      close: (fd) => ({ type: "CLOSE", fd }),
-      unlink: (path) => ({ type: "UNLINK", path }),
-
-      // process control
-      exec: (programName, args = []) => ({
-        type: "EXEC",
-        programName,
-        args,
-      }),
-      exit: (code = 0) => ({ type: "EXIT", code }),
-
-      // per-process heap
-      heapSet: (key, value) => ({ type: "HEAP_SET", key, value }),
-      heapGet: (key) => ({ type: "HEAP_GET", key }),
-
-      // networking over ports
-      listen: (port) => ({ type: "LISTEN", port }),
-      unlisten: (port) => ({ type: "UNLISTEN", port }),
-      sendToPort: (port, payload) => ({ type: "SEND_PORT", port, payload }),
-      recvFromPort: (port, timeoutMs = null) => ({
-        type: "RECV_PORT",
-        port,
-        timeoutMs,
-      }),
-
-      // spawn another program by name
-      spawn: (programName, args = [], priority = 1) => ({
-        type: "SPAWN",
-        programName,
-        args,
-        priority,
-      }),
-
-      // kernel info (for ps/ls/netstat)
-      kernelInfo: (kind) => ({ type: "KINFO", kind }),
-
-      // kill / signals
-      kill: (targetPid, signal = "TERM") => ({
-        type: "KILL",
-        targetPid,
-        signal,
-      }),
-    };
   }
 
   cleanupTerminated() {
-    const deadPids = new Set(
-      this.processes
-        .filter((p) => p.state === ProcessState.TERMINATED)
-        .map((p) => p.pid)
-    );
-
-    this.processes = this.processes.filter(
-      (p) => p.state !== ProcessState.TERMINATED
-    );
-
-    for (const pid of deadPids) {
-      this.mailboxes.delete(pid);
-      for (const [key, info] of this.ports.entries()) {
-        if (info.ownerPid === pid) {
-          this.ports.delete(key);
-        }
-      }
-    }
+    this.processes = this.processes.filter((p) => p.state !== ProcessState.TERMINATED);
   }
-
-  // ---------- Kernel tick ----------
-
-  tick() {
-    this.time += this.tickMs;
-
-    // unblock sleepers and timed-out port receivers
-    for (const pcb of this.processes) {
-      if (
-        pcb.state === ProcessState.BLOCKED &&
-        pcb.blockReason === "sleep" &&
-        pcb.wakeTime !== null &&
-        pcb.wakeTime <= this.time
-      ) {
-        pcb.state = ProcessState.READY;
-        pcb.blockReason = null;
-        pcb.wakeTime = null;
-      }
-
-      if (
-        pcb.state === ProcessState.BLOCKED &&
-        pcb.blockReason === "recv_port" &&
-        pcb.waitTimeoutAt !== null &&
-        pcb.waitTimeoutAt <= this.time
-      ) {
-        pcb.state = ProcessState.READY;
-        pcb.blockReason = null;
-        pcb.waitPort = null;
-        pcb.waitTimeoutAt = null;
-        pcb.lastSyscallResult = null;
-      }
-    }
-
-    const ready = this.processes.filter(
-      (p) => p.state === ProcessState.READY
-    );
-    if (ready.length === 0) return;
-
-    ready.sort((a, b) => b.priority - a.priority);
-    const pcb = ready[0];
-
-    pcb.state = ProcessState.RUNNING;
-
-    const { value: syscallReq, done } = pcb.iterator.next(
-      pcb.lastSyscallResult
-    );
-
-    if (done) {
-      pcb.state = ProcessState.TERMINATED;
-      return;
-    }
-
-    if (syscallReq && typeof syscallReq === "object" && syscallReq.type) {
-      pcb.lastSyscallResult = this._handleSyscall(pcb, syscallReq);
-    } else {
-      pcb.lastSyscallResult = undefined;
-      pcb.state = ProcessState.READY;
-    }
-  }
-
-  // ---------- Helpers ----------
-
-  _allocFd(pcb, meta) {
-    const fd = pcb.nextFd++;
-    pcb.fdTable.set(fd, meta);
-    return fd;
-  }
-
-  _normalizePortKey(port) {
-    return String(port);
-  }
-
-  _handleSyscall(pcb, req) {
-    switch (req.type) {
-      // time
-      case "SLEEP": {
-        pcb.state = ProcessState.BLOCKED;
-        pcb.blockReason = "sleep";
-        pcb.wakeTime = this.time + (req.ms ?? 0);
-        return null;
-      }
-
-      // logging / info
-      case "LOG": {
-        const entry = { time: this.time, pid: pcb.pid, msg: req.msg };
-        this.logs.push(entry);
-        console.log(`[PID ${pcb.pid}]`, req.msg);
-        pcb.state = ProcessState.READY;
-        return null;
-      }
-
-      case "GETPID": {
-        pcb.state = ProcessState.READY;
-        return pcb.pid;
-      }
-
-      // IPC pid-to-pid
-      case "SEND": {
-        const { to, message } = req;
-        if (!this.mailboxes.has(to)) {
-          this.mailboxes.set(to, []);
-        }
-        const msg = { from: pcb.pid, payload: message, time: this.time };
-        this.mailboxes.get(to).push(msg);
-
-        for (const other of this.processes) {
-          if (
-            other.pid === to &&
-            other.state === ProcessState.BLOCKED &&
-            other.blockReason === "recv"
-          ) {
-            const delivered = this._tryDeliverMessage(other);
-            if (delivered !== null) {
-              other.lastSyscallResult = delivered;
-              other.state = ProcessState.READY;
-              other.blockReason = null;
-              other.waitFrom = null;
-            }
-          }
-        }
-
-        pcb.state = ProcessState.READY;
-        return true;
-      }
-
-      case "RECV": {
-        pcb.blockReason = "recv";
-        pcb.waitFrom = req.from ?? null;
-
-        const maybeMsg = this._tryDeliverMessage(pcb);
-        if (maybeMsg !== null) {
-          pcb.state = ProcessState.READY;
-          pcb.blockReason = null;
-          pcb.waitFrom = null;
-          return maybeMsg;
-        } else {
-          pcb.state = ProcessState.BLOCKED;
-          return null;
-        }
-      }
-
-      // VFS
-      case "OPEN": {
-        const path = req.path;
-        const mode = req.mode || "r";
-        let content = this.vfs.get(path);
-
-        if (mode === "r") {
-          if (content === undefined) {
-            pcb.state = ProcessState.READY;
-            return -1;
-          }
-          const fd = this._allocFd(pcb, {
-            type: "file",
-            path,
-            pos: 0,
-            mode,
-          });
-          pcb.state = ProcessState.READY;
-          return fd;
-        }
-
-        if (mode === "w") {
-          content = "";
-          this.vfs.set(path, content);
-          const fd = this._allocFd(pcb, {
-            type: "file",
-            path,
-            pos: 0,
-            mode,
-          });
-          this._saveVfsToStorage();
-          pcb.state = ProcessState.READY;
-          return fd;
-        }
-
-        if (mode === "a") {
-          if (content === undefined) content = "";
-          this.vfs.set(path, content);
-          const fd = this._allocFd(pcb, {
-            type: "file",
-            path,
-            pos: content.length,
-            mode,
-          });
-          this._saveVfsToStorage();
-          pcb.state = ProcessState.READY;
-          return fd;
-        }
-
-        pcb.state = ProcessState.READY;
-        return -1;
-      }
-
-      case "READ": {
-        const fd = req.fd;
-        const n = req.n ?? null;
-        const entry = pcb.fdTable.get(fd);
-        if (!entry || entry.type !== "file") {
-          pcb.state = ProcessState.READY;
-          return null;
-        }
-        const content = this.vfs.get(entry.path) ?? "";
-        const start = entry.pos;
-        const end = n == null ? content.length : start + n;
-        if (start >= content.length) {
-          pcb.state = ProcessState.READY;
-          return "";
-        }
-        const chunk = content.slice(start, end);
-        entry.pos = end;
-        pcb.state = ProcessState.READY;
-        return chunk;
-      }
-
-      case "WRITE": {
-        const fd = req.fd;
-        const data = req.data ?? "";
-
-        if (fd === 1) {
-          console.log(`[PID ${pcb.pid} STDOUT]`, String(data));
-          pcb.state = ProcessState.READY;
-          return String(data).length;
-        }
-        if (fd === 2) {
-          console.error(`[PID ${pcb.pid} STDERR]`, String(data));
-          pcb.state = ProcessState.READY;
-          return String(data).length;
-        }
-
-        const entry = pcb.fdTable.get(fd);
-        if (!entry || entry.type !== "file") {
-          pcb.state = ProcessState.READY;
-          return -1;
-        }
-
-        const text = String(data);
-        let content = this.vfs.get(entry.path) ?? "";
-        const start = entry.pos;
-
-        if (start >= content.length) {
-          content = content + text;
-        } else {
-          const before = content.slice(0, start);
-          const after = content.slice(start + text.length);
-          content = before + text + after;
-        }
-
-        entry.pos = start + text.length;
-        this.vfs.set(entry.path, content);
-        this._saveVfsToStorage();
-        pcb.state = ProcessState.READY;
-        return text.length;
-      }
-
-      case "CLOSE": {
-        pcb.fdTable.delete(req.fd);
-        pcb.state = ProcessState.READY;
-        return 0;
-      }
-
-      case "UNLINK": {
-        const path = req.path;
-        const existed = this.vfs.delete(path);
-        if (existed) {
-          this._saveVfsToStorage();
-        }
-        pcb.state = ProcessState.READY;
-        return existed;
-      }
-
-      // process control
-      case "EXEC": {
-        const { programName, args } = req;
-        const prog = this.programs.get(programName);
-        if (!prog) {
-          pcb.state = ProcessState.READY;
-          return -1;
-        }
-        const sys = this._createSyscalls(pcb.pid);
-        pcb.iterator = prog(sys, ...(args || []));
-        pcb.state = ProcessState.READY;
-        pcb.lastSyscallResult = 0;
-        return 0;
-      }
-
-      case "EXIT": {
-        pcb.exitCode = req.code ?? 0;
-        pcb.state = ProcessState.TERMINATED;
-        return pcb.exitCode;
-      }
-
-      case "HEAP_SET": {
-        pcb.heap[req.key] = req.value;
-        pcb.state = ProcessState.READY;
-        return true;
-      }
-
-      case "HEAP_GET": {
-        const val = pcb.heap[req.key];
-        pcb.state = ProcessState.READY;
-        return val;
-      }
-
-      // networking over ports
-      case "LISTEN": {
-        const portKey = this._normalizePortKey(req.port);
-        if (this.ports.has(portKey)) {
-          pcb.state = ProcessState.READY;
-          return false;
-        }
-        this.ports.set(portKey, {
-          ownerPid: pcb.pid,
-          queue: [],
-        });
-        pcb.state = ProcessState.READY;
-        return true;
-      }
-
-      case "UNLISTEN": {
-        const portKey = this._normalizePortKey(req.port);
-        const entry = this.ports.get(portKey);
-        if (entry && entry.ownerPid === pcb.pid) {
-          this.ports.delete(portKey);
-          pcb.state = ProcessState.READY;
-          return true;
-        }
-        pcb.state = ProcessState.READY;
-        return false;
-      }
-
-      case "SEND_PORT": {
-        const portKey = this._normalizePortKey(req.port);
-        const entry = this.ports.get(portKey);
-        if (!entry) {
-          pcb.state = ProcessState.READY;
-          return false;
-        }
-        entry.queue.push({
-          fromPid: pcb.pid,
-          payload: req.payload,
-          time: this.time,
-        });
-
-        for (const other of this.processes) {
-          if (
-            other.pid === entry.ownerPid &&
-            other.state === ProcessState.BLOCKED &&
-            other.blockReason === "recv_port" &&
-            other.waitPort === portKey
-          ) {
-            const msg = entry.queue.shift();
-            if (msg) {
-              other.lastSyscallResult = msg;
-              other.state = ProcessState.READY;
-              other.blockReason = null;
-              other.waitPort = null;
-              other.waitTimeoutAt = null;
-            }
-          }
-        }
-
-        pcb.state = ProcessState.READY;
-        return true;
-      }
-
-      case "RECV_PORT": {
-        const portKey = this._normalizePortKey(req.port);
-        const timeoutMs = req.timeoutMs;
-        const entry = this.ports.get(portKey);
-
-        if (!entry || entry.ownerPid !== pcb.pid) {
-          pcb.state = ProcessState.READY;
-          return null;
-        }
-
-        if (entry.queue.length === 0) {
-          pcb.state = ProcessState.BLOCKED;
-          pcb.blockReason = "recv_port";
-          pcb.waitPort = portKey;
-          pcb.waitTimeoutAt =
-            timeoutMs == null ? null : this.time + timeoutMs;
-          return null;
-        } else {
-          const msg = entry.queue.shift();
-          pcb.state = ProcessState.READY;
-          return msg;
-        }
-      }
-
-      // spawn from inside
-      case "SPAWN": {
-        const { programName, args, priority } = req;
-        const prog = this.programs.get(programName);
-        if (!prog) {
-          pcb.state = ProcessState.READY;
-          return -1;
-        }
-        const childPid = this.spawn(prog, {
-          name: programName,
-          priority: priority ?? 1,
-          args,
-        });
-        pcb.state = ProcessState.READY;
-        return childPid;
-      }
-
-      // kernel info
-      case "KINFO": {
-        switch (req.kind) {
-          case "PS":
-            pcb.state = ProcessState.READY;
-            return this.getProcessTable();
-          case "PORTS":
-            pcb.state = ProcessState.READY;
-            return this.getPortsTable();
-          case "VFS":
-            pcb.state = ProcessState.READY;
-            return this.listFiles();
-          default:
-            pcb.state = ProcessState.READY;
-            return null;
-        }
-      }
-
-      // kill / signals
-      case "KILL": {
-        const targetPid = req.targetPid;
-        const signal = (req.signal || "TERM").toUpperCase();
-        const target = this.processes.find((p) => p.pid === targetPid);
-
-        pcb.state = ProcessState.READY;
-
-        if (!target) {
-          return false;
-        }
-
-        if (signal === "TERM" || signal === "KILL") {
-          target.exitCode = signal === "KILL" ? -9 : -15;
-          target.state = ProcessState.TERMINATED;
-          return true;
-        }
-
-        return false;
-      }
-
-      default: {
-        console.warn("Unknown syscall:", req);
-        pcb.state = ProcessState.READY;
-        return null;
-      }
-    }
-  }
-
-  _tryDeliverMessage(pcb) {
-    const queue = this.mailboxes.get(pcb.pid) || [];
-    if (queue.length === 0) return null;
-
-    if (pcb.waitFrom == null) {
-      return queue.shift();
-    } else {
-      const idx = queue.findIndex((m) => m.from === pcb.waitFrom);
-      if (idx === -1) return null;
-      const [msg] = queue.splice(idx, 1);
-      return msg;
-    }
-  }
-
-  // ---------- UI helpers ----------
 
   getProcessTable() {
     return this.processes.map((p) => ({
@@ -651,256 +64,785 @@ export class Kernel {
       priority: p.priority,
       state: p.state,
       blockReason: p.blockReason,
-      wakeTime: p.wakeTime,
       exitCode: p.exitCode,
-      lastSyscallResult: p.lastSyscallResult,
       spawnTime: p.spawnTime,
     }));
   }
 
   getPortsTable() {
-    return Array.from(this.ports.entries()).map(([portKey, info]) => ({
-      port: portKey,
-      ownerPid: info.ownerPid,
-      queueLength: info.queue.length,
-    }));
+    const arr = [];
+    for (const [port, entry] of this.ports.entries()) {
+      arr.push({
+        port,
+        ownerPid: entry.ownerPid,
+        queueLength: entry.queue.length,
+      });
+    }
+    arr.sort((a, b) => a.port - b.port);
+    return arr;
   }
 
   listFiles() {
-    return Array.from(this.vfs.entries()).map(([path, content]) => ({
-      path,
-      size: content.length,
-      preview: content.slice(0, 80),
-    }));
-  }
-
-  getLogs(limit = 200) {
-    if (this.logs.length <= limit) return this.logs.slice();
-    return this.logs.slice(this.logs.length - limit);
-  }
-}
-
-// ----------------------------------------------------------
-// Programs: echo server/client, shell, ps, ls, netstat, help,
-// kill, cat, echo-file, rm
-// ----------------------------------------------------------
-
-export function* echoServer(sys, port) {
-  const ok = yield sys.listen(port);
-  if (!ok) {
-    yield sys.log(`Echo: unable to listen on port ${port}`);
-    yield sys.exit(1);
-  }
-  yield sys.log(`Echo server listening on port ${port}`);
-
-  while (true) {
-    const msg = yield sys.recvFromPort(port);
-    if (!msg) continue;
-    const { fromPid, payload } = msg;
-    yield sys.log(
-      `Echo server: from PID ${fromPid} -> ${JSON.stringify(payload)}`
-    );
-    yield sys.send(fromPid, {
-      type: "ECHO_REPLY",
-      port,
-      payload,
-    });
-  }
-}
-
-export function* echoClient(sys, port, message) {
-  const myPid = yield sys.getPid();
-  yield sys.log(`Client ${myPid}: send to port ${port}: ${message}`);
-
-  yield sys.sendToPort(port, { text: message, from: myPid });
-
-  const reply = yield sys.recv();
-  if (reply && reply.payload && reply.payload.type === "ECHO_REPLY") {
-    yield sys.log(
-      `Client ${myPid}: reply = ${JSON.stringify(reply.payload.payload)}`
-    );
-  } else {
-    yield sys.log(`Client ${myPid}: no valid reply`);
-  }
-  yield sys.exit(0);
-}
-
-// Shell on port 9999
-export function* shellProcess(sys) {
-  const PORT = 9999;
-  const ok = yield sys.listen(PORT);
-  if (!ok) {
-    yield sys.log(`Shell: port ${PORT} already in use`);
-    yield sys.exit(1);
-  }
-  yield sys.log(`Shell ready on port ${PORT}`);
-
-  while (true) {
-    const msg = yield sys.recvFromPort(PORT);
-    if (!msg) continue;
-
-    const { fromPid, payload } = msg;
-    const line = String(payload?.command || "").trim();
-    if (!line) continue;
-
-    const parts = line.split(/\s+/);
-    const cmd = parts[0];
-    const args = parts.slice(1);
-
-    const childPid = yield sys.spawn(cmd, args, 1);
-
-    if (childPid < 0) {
-      yield sys.send(fromPid, {
-        type: "SHELL_RESULT",
-        ok: false,
-        output: `Command not found: ${cmd}`,
-      });
-    } else {
-      yield sys.send(fromPid, {
-        type: "SHELL_RESULT",
-        ok: true,
-        output: `Started ${cmd} (pid=${childPid})`,
+    const out = [];
+    for (const [path, meta] of this.vfs.entries()) {
+      const text = meta.content ?? "";
+      const preview =
+        text.length > 60 ? text.slice(0, 57).replace(/\s+/g, " ") + "..." : text;
+      out.push({
+        path,
+        size: text.length,
+        preview,
       });
     }
-  }
-}
-
-// ps: print process table
-export function* psProgram(sys) {
-  const table = yield sys.kernelInfo("PS");
-  yield sys.log("=== ps ===");
-  for (const p of table) {
-    yield sys.log(
-      `pid=${p.pid} name=${p.name} prio=${p.priority} state=${p.state} block=${
-        p.blockReason || "-"
-      }`
-    );
-  }
-  yield sys.exit(0);
-}
-
-// ls: print VFS
-export function* lsProgram(sys) {
-  const files = yield sys.kernelInfo("VFS");
-  yield sys.log("=== ls (VFS) ===");
-  for (const f of files) {
-    yield sys.log(`${f.path} (${f.size} bytes)`);
-  }
-  yield sys.exit(0);
-}
-
-// netstat: print ports
-export function* netstatProgram(sys) {
-  const ports = yield sys.kernelInfo("PORTS");
-  yield sys.log("=== netstat ===");
-  for (const p of ports) {
-    yield sys.log(
-      `port=${p.port} ownerPid=${p.ownerPid} queue=${p.queueLength}`
-    );
-  }
-  yield sys.exit(0);
-}
-
-// help
-export function* helpProgram(sys) {
-  yield sys.log("Available commands:");
-  yield sys.log("  echo-client <port> <msg>   - send message to a server");
-  yield sys.log("  echo-server <port>        - start echo server on port");
-  yield sys.log("  ps                        - show process table");
-  yield sys.log("  ls                        - list virtual file system");
-  yield sys.log("  netstat                   - show open ports");
-  yield sys.log("  cat <path>                - print file contents");
-  yield sys.log("  echo-file <path> <text>   - write text to a file");
-  yield sys.log("  rm <path>                 - remove a file");
-  yield sys.log("  kill <pid> [SIGNAL]       - terminate a process");
-  yield sys.log("  help                      - this help");
-  yield sys.exit(0);
-}
-
-// kill
-export function* killProgram(sys, pidStr, signalName) {
-  if (!pidStr) {
-    yield sys.log("Usage: kill <pid> [SIGNAL]");
-    yield sys.exit(1);
+    out.sort((a, b) => a.path.localeCompare(b.path));
+    return out;
   }
 
-  const pid = Number(pidStr);
-  if (!Number.isInteger(pid)) {
-    yield sys.log(`kill: invalid pid: ${pidStr}`);
-    yield sys.exit(1);
+  getLogs() {
+    return this.logs.slice(-500);
   }
 
-  const signal = (signalName || "TERM").toUpperCase();
-  const ok = yield sys.kill(pid, signal);
+  // ---------- Internal helpers ----------
 
-  if (ok) {
-    yield sys.log(`kill: sent ${signal} to pid ${pid}`);
-    yield sys.exit(0);
-  } else {
-    yield sys.log(`kill: no such pid ${pid}`);
-    yield sys.exit(1);
+  _spawnInternal(program, opts = {}) {
+    const pid = this.nextPid++;
+    const pcb = {
+      pid,
+      name: opts.name || `proc-${pid}`,
+      priority: opts.priority ?? 1,
+      state: ProcessState.READY,
+      blockReason: null,
+      exitCode: null,
+      program,
+      iterator: null,
+      waitingFor: null,
+      nextValue: undefined,
+      spawnTime: Date.now(),
+    };
+
+    const sys = this._createSyscalls(pcb);
+    try {
+      pcb.iterator = program(sys);
+    } catch (err) {
+      this._log(pcb.pid, `Error starting program: ${String(err)}`);
+      pcb.state = ProcessState.TERMINATED;
+      pcb.exitCode = 1;
+      return pid;
+    }
+
+    this.processes.push(pcb);
+    return pid;
   }
-}
 
-// cat
-export function* catProgram(sys, path) {
-  const target = path || "/etc/motd";
-  const fd = yield sys.open(target, "r");
-  if (fd < 0) {
-    yield sys.log(`cat: cannot open ${target}`);
-    yield sys.exit(1);
+  _findPcb(pid) {
+    return this.processes.find((p) => p.pid === pid) || null;
   }
 
-  yield sys.log(`=== cat ${target} ===`);
-  while (true) {
-    const chunk = yield sys.read(fd, 256);
-    if (!chunk) break;
-    const text = String(chunk);
-    const lines = text.split("\n");
-    for (const line of lines) {
-      if (line.length > 0) {
-        yield sys.log(line);
+  _runProcess(pcb) {
+    if (!pcb.iterator || pcb.state === ProcessState.TERMINATED) return;
+
+    pcb.state = ProcessState.RUNNING;
+    const input = pcb.nextValue;
+    pcb.nextValue = undefined;
+
+    let result;
+    try {
+      result = pcb.iterator.next(input);
+    } catch (err) {
+      this._log(pcb.pid, `Process crashed: ${String(err)}`);
+      pcb.state = ProcessState.TERMINATED;
+      pcb.blockReason = null;
+      pcb.exitCode = 1;
+      return;
+    }
+
+    if (result.done) {
+      pcb.state = ProcessState.TERMINATED;
+      pcb.blockReason = null;
+      pcb.exitCode = typeof result.value === "number" ? result.value : 0;
+      return;
+    }
+
+    const syscall = result.value || {};
+    this._handleSyscall(pcb, syscall);
+  }
+
+  _handleSyscall(pcb, syscall) {
+    switch (syscall.type) {
+      case "SLEEP": {
+        const until = this.timeMs + (syscall.ms || 0);
+        pcb.blockReason = "sleep";
+        pcb.state = ProcessState.BLOCKED;
+        pcb.waitingFor = { type: "SLEEP", until };
+        break;
+      }
+
+      case "LOG": {
+        this._log(pcb.pid, syscall.message ?? "");
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = true;
+        break;
+      }
+
+      case "GET_PID": {
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = pcb.pid;
+        break;
+      }
+
+      case "SEND": {
+        const target = this._findPcb(syscall.toPid);
+        if (target) {
+          const queue = this.mailbox.get(target.pid) || [];
+          const msg = { fromPid: pcb.pid, payload: syscall.payload };
+          queue.push(msg);
+          this.mailbox.set(target.pid, queue);
+
+          if (
+            target.state === ProcessState.BLOCKED &&
+            target.blockReason === "recv" &&
+            queue.length > 0
+          ) {
+            const deliver = queue.shift();
+            this.mailbox.set(target.pid, queue);
+            target.state = ProcessState.READY;
+            target.blockReason = null;
+            target.nextValue = deliver;
+          }
+        }
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = true;
+        break;
+      }
+
+      case "RECV": {
+        const queue = this.mailbox.get(pcb.pid) || [];
+        if (queue.length > 0) {
+          const msg = queue.shift();
+          this.mailbox.set(pcb.pid, queue);
+          pcb.state = ProcessState.READY;
+          pcb.blockReason = null;
+          pcb.nextValue = msg;
+        } else {
+          pcb.state = ProcessState.BLOCKED;
+          pcb.blockReason = "recv";
+          pcb.waitingFor = { type: "RECV" };
+        }
+        break;
+      }
+
+      case "LISTEN": {
+        const port = Number(syscall.port);
+        const existing = this.ports.get(port);
+        if (existing && existing.ownerPid !== pcb.pid) {
+          pcb.state = ProcessState.READY;
+          pcb.blockReason = null;
+          pcb.nextValue = false;
+        } else {
+          const entry = existing || { ownerPid: pcb.pid, queue: [] };
+          entry.ownerPid = pcb.pid;
+          this.ports.set(port, entry);
+          pcb.state = ProcessState.READY;
+          pcb.blockReason = null;
+          pcb.nextValue = true;
+        }
+        break;
+      }
+
+      case "SEND_PORT": {
+        const port = Number(syscall.port);
+        const entry = this.ports.get(port);
+        if (entry) {
+          const msg = { fromPid: pcb.pid, payload: syscall.payload };
+          entry.queue.push(msg);
+          const target = this._findPcb(entry.ownerPid);
+          if (
+            target &&
+            target.state === ProcessState.BLOCKED &&
+            target.blockReason === "recv_port" &&
+            entry.queue.length > 0
+          ) {
+            const deliver = entry.queue.shift();
+            target.state = ProcessState.READY;
+            target.blockReason = null;
+            target.nextValue = deliver;
+          }
+        }
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = true;
+        break;
+      }
+
+      case "RECV_PORT": {
+        const port = Number(syscall.port);
+        const entry = this.ports.get(port);
+        if (entry && entry.queue.length > 0) {
+          const msg = entry.queue.shift();
+          pcb.state = ProcessState.READY;
+          pcb.blockReason = null;
+          pcb.nextValue = msg;
+        } else {
+          pcb.state = ProcessState.BLOCKED;
+          pcb.blockReason = "recv_port";
+          pcb.waitingFor = { type: "RECV_PORT", port };
+        }
+        break;
+      }
+
+      case "SPAWN": {
+        const childPid = this._spawnInternal(syscall.program, syscall.opts || {});
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = childPid;
+        break;
+      }
+
+      case "EXIT": {
+        pcb.state = ProcessState.TERMINATED;
+        pcb.blockReason = null;
+        pcb.exitCode =
+          typeof syscall.code === "number" ? syscall.code : pcb.exitCode ?? 0;
+        break;
+      }
+
+      case "PS": {
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = this.getProcessTable();
+        break;
+      }
+
+      case "LIST_FILES": {
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = this.listFiles();
+        break;
+      }
+
+      case "READ_FILE": {
+        const path = syscall.path || "";
+        const meta = this.vfs.get(path) || null;
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = meta ? meta.content : null;
+        break;
+      }
+
+      case "WRITE_FILE": {
+        const path = syscall.path || "";
+        const text = String(syscall.text ?? "");
+        this._writeFile(path, text);
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = text.length;
+        break;
+      }
+
+      case "UNLINK": {
+        const path = syscall.path || "";
+        const ok = this._unlinkFile(path);
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = ok;
+        break;
+      }
+
+      case "LIST_PORTS": {
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = this.getPortsTable();
+        break;
+      }
+
+      case "KILL": {
+        const target = this._findPcb(syscall.targetPid);
+        if (target) {
+          this._log(
+            pcb.pid,
+            `Sending ${syscall.signal || "TERM"} to pid=${target.pid}`
+          );
+          target.state = ProcessState.TERMINATED;
+          target.blockReason = null;
+          target.exitCode = -1;
+        }
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = true;
+        break;
+      }
+
+      default: {
+        this._log(pcb.pid, `Unknown syscall: ${String(syscall.type)}`);
+        pcb.state = ProcessState.READY;
+        pcb.blockReason = null;
+        pcb.nextValue = null;
+        break;
+      }
+    }
+
+    // wake sleeping processes
+    for (const p of this.processes) {
+      if (
+        p.state === ProcessState.BLOCKED &&
+        p.waitingFor &&
+        p.waitingFor.type === "SLEEP" &&
+        this.timeMs >= p.waitingFor.until
+      ) {
+        p.state = ProcessState.READY;
+        p.blockReason = null;
+        p.waitingFor = null;
+        p.nextValue = true;
       }
     }
   }
 
-  yield sys.close(fd);
-  yield sys.exit(0);
+  _log(pid, msg) {
+    const entry = {
+      time: Date.now(),
+      pid,
+      msg,
+    };
+    this.logs.push(entry);
+    if (this.logs.length > 1000) {
+      this.logs.shift();
+    }
+  }
+
+  // ---------- VFS helpers ----------
+
+  _writeFile(path, content) {
+    const now = Date.now();
+    const normPath = path.startsWith("/") ? path : `/${path}`;
+    const meta = this.vfs.get(normPath) || {
+      path: normPath,
+      createdAt: now,
+      updatedAt: now,
+      content: "",
+    };
+    meta.content = String(content);
+    meta.updatedAt = now;
+    this.vfs.set(normPath, meta);
+    this._saveVfsToStorage();
+  }
+
+  _unlinkFile(path) {
+    const normPath = path.startsWith("/") ? path : `/${path}`;
+    const existed = this.vfs.delete(normPath);
+    this._saveVfsToStorage();
+    return existed;
+  }
+
+  _saveVfsToStorage() {
+    try {
+      const obj = {};
+      for (const [path, meta] of this.vfs.entries()) {
+        obj[path] = {
+          path: meta.path,
+          createdAt: meta.createdAt,
+          updatedAt: meta.updatedAt,
+          content: meta.content,
+        };
+      }
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem("bvkernel_vfs", JSON.stringify(obj));
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  _restoreVfsFromStorage() {
+    try {
+      if (typeof localStorage === "undefined") return;
+      const raw = localStorage.getItem("bvkernel_vfs");
+      if (!raw) return;
+      const obj = JSON.parse(raw);
+      for (const [path, meta] of Object.entries(obj)) {
+        this.vfs.set(path, {
+          path,
+          createdAt: meta.createdAt || Date.now(),
+          updatedAt: meta.updatedAt || meta.createdAt || Date.now(),
+          content: meta.content || "",
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  // ---------- Syscall factory ----------
+
+  _createSyscalls(pcb) {
+    const kernel = this;
+    return {
+      *sleep(ms) {
+        return yield { type: "SLEEP", ms };
+      },
+      *log(message) {
+        return yield { type: "LOG", message };
+      },
+      *getPid() {
+        return yield { type: "GET_PID" };
+      },
+      *send(toPid, payload) {
+        return yield { type: "SEND", toPid, payload };
+      },
+      *recv() {
+        return yield { type: "RECV" };
+      },
+      *listen(port) {
+        return yield { type: "LISTEN", port };
+      },
+      *sendToPort(port, payload) {
+        return yield { type: "SEND_PORT", port, payload };
+      },
+      *recvFromPort(port) {
+        return yield { type: "RECV_PORT", port };
+      },
+      *spawn(program, opts = {}) {
+        return yield { type: "SPAWN", program, opts };
+      },
+      *exit(code = 0) {
+        return yield { type: "EXIT", code };
+      },
+      *ps() {
+        return yield { type: "PS" };
+      },
+      *listFiles() {
+        return yield { type: "LIST_FILES" };
+      },
+      *readFile(path) {
+        return yield { type: "READ_FILE", path };
+      },
+      *writeFile(path, text) {
+        return yield { type: "WRITE_FILE", path, text };
+      },
+      *unlink(path) {
+        return yield { type: "UNLINK", path };
+      },
+      *listPorts() {
+        return yield { type: "LIST_PORTS" };
+      },
+      *kill(targetPid, signal = "TERM") {
+        return yield { type: "KILL", targetPid, signal };
+      },
+      // access to kernel for debug, if serve
+      get kernel() {
+        return kernel;
+      },
+    };
+  }
 }
 
-// echo-file: write text to a file
-export function* echoFileProgram(sys, path, ...rest) {
+// ------------------ Userland programs ------------------
+
+// Echo server on a virtual port
+export function* echoServer(sys, port = 8080) {
+  const ok = yield* sys.listen(port);
+  if (!ok) {
+    yield* sys.log(`Echo server: port ${port} already in use`);
+    yield* sys.exit(1);
+    return;
+  }
+  const myPid = yield* sys.getPid();
+  yield* sys.log(`Echo server listening on port ${port}`);
+
+  while (true) {
+    const msg = yield* sys.recvFromPort(port);
+    if (!msg) continue;
+    const { fromPid, payload } = msg;
+    yield* sys.log(
+      `Echo server: from PID ${fromPid} -> ${JSON.stringify(payload)}`
+    );
+    if (payload && typeof payload.text === "string") {
+      yield* sys.send(fromPid, {
+        type: "ECHO_REPLY",
+        text: payload.text,
+        from: myPid,
+      });
+    } else {
+      yield* sys.send(fromPid, {
+        type: "ECHO_REPLY",
+        text: "[no text]",
+        from: myPid,
+      });
+    }
+  }
+}
+
+// Echo client: send a message to a port and wait for reply
+export function* echoClient(sys, port = 8080, text = "hello-from-client") {
+  const myPid = yield* sys.getPid();
+  yield* sys.log(`Client ${myPid}: send to port ${port}: ${text}`);
+  yield* sys.sendToPort(port, { text, from: myPid });
+  const reply = yield* sys.recv();
+  yield* sys.log(`Client ${myPid}: reply = ${JSON.stringify(reply?.payload)}`);
+  yield* sys.exit(0);
+}
+
+// ps: show process table
+export function* psProgram(sys) {
+  const table = yield* sys.ps();
+  yield* sys.log("=== ps ===");
+  for (const p of table) {
+    yield* sys.log(
+      `pid=${p.pid} name=${p.name} prio=${p.priority} state=${p.state} block=${p.blockReason || "-"}`
+    );
+  }
+  yield* sys.exit(0);
+}
+
+// ls: list virtual file system
+export function* lsProgram(sys) {
+  const files = yield* sys.listFiles();
+  yield* sys.log("=== ls (VFS) ===");
+  for (const f of files) {
+    yield* sys.log(`${f.path} (${f.size} bytes)`);
+  }
+  yield* sys.exit(0);
+}
+
+// netstat: list ports
+export function* netstatProgram(sys) {
+  const ports = yield* sys.listPorts();
+  yield* sys.log("=== netstat ===");
+  for (const p of ports) {
+    yield* sys.log(
+      `port=${p.port} ownerPid=${p.ownerPid} queue=${p.queueLength}`
+    );
+  }
+  yield* sys.exit(0);
+}
+
+// cat: print file contents
+export function* catProgram(sys, path) {
   if (!path) {
-    yield sys.log("Usage: echo-file <path> <text...>");
-    yield sys.exit(1);
+    yield* sys.log("cat: missing path");
+    yield* sys.exit(1);
+    return;
   }
-
-  const text = rest.join(" ");
-  const fd = yield sys.open(path, "w");
-  if (fd < 0) {
-    yield sys.log(`echo-file: cannot open ${path} for writing`);
-    yield sys.exit(1);
+  const text = yield* sys.readFile(path);
+  if (text == null) {
+    yield* sys.log(`cat: ${path}: no such file`);
+    yield* sys.exit(1);
+    return;
   }
-
-  yield sys.write(fd, text + "\n");
-  yield sys.close(fd);
-  yield sys.log(`echo-file: wrote ${text.length} chars to ${path}`);
-  yield sys.exit(0);
+  yield* sys.log(`=== cat ${path} ===`);
+  yield* sys.log(text);
+  yield* sys.exit(0);
 }
 
-// rm: remove a file
+// echo-file: write arbitrary text to a file
+export function* echoFileProgram(sys, path, ...textParts) {
+  if (!path) {
+    yield* sys.log("echo-file: missing path");
+    yield* sys.exit(1);
+    return;
+  }
+  const text = textParts.join(" ");
+  const bytes = yield* sys.writeFile(path, text);
+  yield* sys.log(`echo-file: wrote ${bytes} chars to ${path}`);
+  yield* sys.exit(0);
+}
+
+// rm: delete a file
 export function* rmProgram(sys, path) {
   if (!path) {
-    yield sys.log("Usage: rm <path>");
-    yield sys.exit(1);
+    yield* sys.log("rm: missing path");
+    yield* sys.exit(1);
+    return;
   }
-
-  const ok = yield sys.unlink(path);
+  const ok = yield* sys.unlink(path);
   if (ok) {
-    yield sys.log(`rm: removed ${path}`);
-    yield sys.exit(0);
+    yield* sys.log(`rm: removed ${path}`);
+    yield* sys.exit(0);
   } else {
-    yield sys.log(`rm: ${path}: no such file`);
-    yield sys.exit(1);
+    yield* sys.log(`rm: ${path}: no such file`);
+    yield* sys.exit(1);
   }
 }
+
+// kill: terminate a process
+export function* killProgram(sys, targetPid, signal = "TERM") {
+  if (!targetPid && targetPid !== 0) {
+    yield* sys.log("kill: missing pid");
+    yield* sys.exit(1);
+    return;
+  }
+  yield* sys.kill(Number(targetPid), signal);
+  yield* sys.exit(0);
+}
+
+// help: list commands
+export function* helpProgram(sys) {
+  yield* sys.log("Available commands:");
+  yield* sys.log(
+    "  echo-client <port> <msg>    - send message to a server"
+  );
+  yield* sys.log("  echo-server <port>          - start echo server on port");
+  yield* sys.log("  ps                          - show process table");
+  yield* sys.log("  ls                          - list virtual file system");
+  yield* sys.log("  netstat                     - show open ports");
+  yield* sys.log("  cat <path>                  - print file contents");
+  yield* sys.log("  echo-file <path> <text>     - write text to a file");
+  yield* sys.log("  rm <path>                   - remove a file");
+  yield* sys.log("  kill <pid> [SIGNAL]         - terminate a process");
+  yield* sys.log("  help                        - this help");
+  yield* sys.log("You can chain commands with ';', e.g.: ps; ls; netstat");
+  yield* sys.exit(0);
+}
+
+// Shell process with multi-command support
+export function* shellProcess(sys) {
+  const SHELL_PORT = 9999;
+  yield* sys.listen(SHELL_PORT);
+  yield* sys.log(`Shell ready on port ${SHELL_PORT}`);
+
+  while (true) {
+    const msg = yield* sys.recvFromPort(SHELL_PORT);
+    if (!msg) continue;
+
+    const { fromPid, payload } = msg;
+    const line = String(payload.command || "").trim();
+    if (!line) {
+      yield* sys.send(fromPid, {
+        type: "SHELL_RESULT",
+        output: "",
+      });
+      continue;
+    }
+
+    yield* sys.log(`Shell client ${fromPid}: comando "${line}"`);
+
+    const parts = line
+      .split(";")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    const outputs = [];
+
+    for (const part of parts) {
+      const [cmd, ...args] = part.split(/\s+/);
+      if (!cmd) continue;
+
+      switch (cmd) {
+        case "echo-client": {
+          const [portStr, ...msgParts] = args;
+          const port = Number(portStr || 8080);
+          const text = msgParts.join(" ") || "hello";
+          const pid = yield* sys.spawn((s) => echoClient(s, port, text), {
+            name: "echo-client",
+            priority: 1,
+          });
+          outputs.push(`Started echo-client (pid=${pid})`);
+          break;
+        }
+
+        case "echo-server": {
+          const [portStr] = args;
+          const port = Number(portStr || 8080);
+          const pid = yield* sys.spawn((s) => echoServer(s, port), {
+            name: "echo-server",
+            priority: 2,
+          });
+          outputs.push(`Started echo-server (pid=${pid})`);
+          break;
+        }
+
+        case "ps": {
+          const pid = yield* sys.spawn(psProgram, {
+            name: "ps",
+            priority: 1,
+          });
+          outputs.push(`Started ps (pid=${pid})`);
+          break;
+        }
+
+        case "ls": {
+          const pid = yield* sys.spawn(lsProgram, {
+            name: "ls",
+            priority: 1,
+          });
+          outputs.push(`Started ls (pid=${pid})`);
+          break;
+        }
+
+        case "netstat": {
+          const pid = yield* sys.spawn(netstatProgram, {
+            name: "netstat",
+            priority: 1,
+          });
+          outputs.push(`Started netstat (pid=${pid})`);
+          break;
+        }
+
+        case "cat": {
+          const [path] = args;
+          const pid = yield* sys.spawn((s) => catProgram(s, path), {
+            name: "cat",
+            priority: 1,
+          });
+          outputs.push(`Started cat (pid=${pid})`);
+          break;
+        }
+
+        case "echo-file": {
+          const [path, ...textParts] = args;
+          const pid = yield* sys.spawn(
+            (s) => echoFileProgram(s, path, ...textParts),
+            { name: "echo-file", priority: 1 }
+          );
+          outputs.push(`Started echo-file (pid=${pid})`);
+          break;
+        }
+
+        case "rm": {
+          const [path] = args;
+          const pid = yield* sys.spawn((s) => rmProgram(s, path), {
+            name: "rm",
+            priority: 1,
+          });
+          outputs.push(`Started rm (pid=${pid})`);
+          break;
+        }
+
+        case "kill": {
+          const [pidStr, signal = "TERM"] = args;
+          const targetPid = Number(pidStr);
+          const pid = yield* sys.spawn(
+            (s) => killProgram(s, targetPid, signal),
+            { name: "kill", priority: 2 }
+          );
+          outputs.push(`Started kill (pid=${pid})`);
+          break;
+        }
+
+        case "help": {
+          const pid = yield* sys.spawn(helpProgram, {
+            name: "help",
+            priority: 1,
+          });
+          outputs.push(`Started help (pid=${pid})`);
+          break;
+        }
+
+        default: {
+          outputs.push(`Command not found: ${cmd}`);
+          break;
+        }
+      }
+    }
+
+    const finalOut = outputs.join("\n");
+    yield* sys.send(fromPid, {
+      type: "SHELL_RESULT",
+      output: finalOut,
+    });
+  }
+}
+
+// (fine kernel.js)
