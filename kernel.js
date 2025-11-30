@@ -1,4 +1,4 @@
-// src/kernel/kernel.js
+// kernel.js
 
 export const ProcessState = Object.freeze({
   READY: "READY",
@@ -12,26 +12,25 @@ let GLOBAL_NEXT_PID = 1;
 export class Kernel {
   constructor({ tickMs = 50 } = {}) {
     this.tickMs = tickMs;
-    this.time = 0;              // tempo logico del kernel
-    this.processes = [];        // PCB
-    this.mailboxes = new Map(); // pid -> array di messaggi
-    this.vfs = new Map();       // file system in RAM: path -> string
-    this.programs = new Map();  // nome -> factory (sys, ...args) => generator
+    this.time = 0; // logical time
+    this.processes = [];
+    this.mailboxes = new Map(); // pid -> messages
+    this.vfs = new Map(); // path -> string
+    this.programs = new Map(); // name -> generator factory
 
-    this.ports = new Map();     // port -> { ownerPid, queue: [] }
-    this.logs = [];             // log interni per la UI
+    this.ports = new Map(); // portKey (string) -> { ownerPid, queue: [] }
+    this.logs = [];
 
-    // file di sistema di esempio
     this.vfs.set("/etc/motd", "Benvenuto nel mini-kernel in JS!\n");
   }
 
-  // ---------- gestione programmi ----------
+  // ---------- Program registration ----------
 
   registerProgram(name, generatorFactory) {
     this.programs.set(name, generatorFactory);
   }
 
-  // ---------- gestione processi ----------
+  // ---------- Process management ----------
 
   spawn(programFactory, { name = "proc", priority = 1, args = [] } = {}) {
     const pid = GLOBAL_NEXT_PID++;
@@ -46,19 +45,19 @@ export class Kernel {
       iterator,
       state: ProcessState.READY,
       wakeTime: null,
-      blockReason: null,   // "sleep", "recv", "recv_port", ...
+      blockReason: null, // "sleep", "recv", "recv_port"
       waitFrom: null,
       waitPort: null,
-      waitTimeoutAt: null, // per timeout RECV_PORT
+      waitTimeoutAt: null,
       lastSyscallResult: undefined,
       exitCode: null,
       fdTable: new Map(),
       nextFd: 3,
       heap: {},
-      spawnTime: now,      // per età nella UI
+      spawnTime: now,
     };
 
-    // prealloca fd 0/1/2 (stdin/stdout/stderr)
+    // preallocate stdin/out/err
     pcb.fdTable.set(0, { type: "stdin" });
     pcb.fdTable.set(1, { type: "stdout" });
     pcb.fdTable.set(2, { type: "stderr" });
@@ -70,24 +69,24 @@ export class Kernel {
 
   _createSyscalls(pid) {
     return {
-      // tempo / scheduling
+      // time / scheduling
       sleep: (ms) => ({ type: "SLEEP", ms }),
 
       // IPC pid-to-pid
       recv: (from = null) => ({ type: "RECV", from }),
       send: (to, message) => ({ type: "SEND", to, message }),
 
-      // info processo & log
+      // info / log
       getPid: () => ({ type: "GETPID" }),
       log: (msg) => ({ type: "LOG", msg }),
 
-      // file system stile Unix (semplificato)
+      // VFS
       open: (path, mode = "r") => ({ type: "OPEN", path, mode }),
       read: (fd, n = null) => ({ type: "READ", fd, n }),
       write: (fd, data) => ({ type: "WRITE", fd, data }),
       close: (fd) => ({ type: "CLOSE", fd }),
 
-      // gestione processo
+      // process control
       exec: (programName, args = []) => ({
         type: "EXEC",
         programName,
@@ -95,11 +94,11 @@ export class Kernel {
       }),
       exit: (code = 0) => ({ type: "EXIT", code }),
 
-      // heap per processo
+      // per-process heap
       heapSet: (key, value) => ({ type: "HEAP_SET", key, value }),
       heapGet: (key) => ({ type: "HEAP_GET", key }),
 
-      // networking a porte
+      // networking over ports
       listen: (port) => ({ type: "LISTEN", port }),
       unlisten: (port) => ({ type: "UNLISTEN", port }),
       sendToPort: (port, payload) => ({ type: "SEND_PORT", port, payload }),
@@ -109,19 +108,24 @@ export class Kernel {
         timeoutMs,
       }),
 
-      // spawn da dentro un processo: shell, init, ecc.
+      // spawn another program by name
       spawn: (programName, args = [], priority = 1) => ({
         type: "SPAWN",
         programName,
         args,
         priority,
       }),
+
+      // kernel info (for ps/ls/netstat)
+      kernelInfo: (kind) => ({ type: "KINFO", kind }),
     };
   }
 
   cleanupTerminated() {
     const deadPids = new Set(
-      this.processes.filter((p) => p.state === ProcessState.TERMINATED).map((p) => p.pid)
+      this.processes
+        .filter((p) => p.state === ProcessState.TERMINATED)
+        .map((p) => p.pid)
     );
 
     this.processes = this.processes.filter(
@@ -130,22 +134,21 @@ export class Kernel {
 
     for (const pid of deadPids) {
       this.mailboxes.delete(pid);
-      for (const [port, info] of this.ports.entries()) {
+      for (const [key, info] of this.ports.entries()) {
         if (info.ownerPid === pid) {
-          this.ports.delete(port);
+          this.ports.delete(key);
         }
       }
     }
   }
 
-  // ---------- ciclo del kernel ----------
+  // ---------- Kernel tick ----------
 
   tick() {
     this.time += this.tickMs;
 
-    // sblocca chi ha finito di dormire o ha timeout
+    // unblock sleepers and timed-out port receivers
     for (const pcb of this.processes) {
-      // sleep
       if (
         pcb.state === ProcessState.BLOCKED &&
         pcb.blockReason === "sleep" &&
@@ -157,7 +160,6 @@ export class Kernel {
         pcb.wakeTime = null;
       }
 
-      // timeout su recv_port
       if (
         pcb.state === ProcessState.BLOCKED &&
         pcb.blockReason === "recv_port" &&
@@ -172,7 +174,6 @@ export class Kernel {
       }
     }
 
-    // scegli processo READY a priorità più alta
     const ready = this.processes.filter(
       (p) => p.state === ProcessState.READY
     );
@@ -195,13 +196,12 @@ export class Kernel {
     if (syscallReq && typeof syscallReq === "object" && syscallReq.type) {
       pcb.lastSyscallResult = this._handleSyscall(pcb, syscallReq);
     } else {
-      // yield cooperativo senza syscall
       pcb.lastSyscallResult = undefined;
       pcb.state = ProcessState.READY;
     }
   }
 
-  // ---------- helper interni ----------
+  // ---------- Helpers ----------
 
   _allocFd(pcb, meta) {
     const fd = pcb.nextFd++;
@@ -209,9 +209,13 @@ export class Kernel {
     return fd;
   }
 
+  _normalizePortKey(port) {
+    return String(port);
+  }
+
   _handleSyscall(pcb, req) {
     switch (req.type) {
-      // ---- tempo / sleep ----
+      // time
       case "SLEEP": {
         pcb.state = ProcessState.BLOCKED;
         pcb.blockReason = "sleep";
@@ -219,7 +223,7 @@ export class Kernel {
         return null;
       }
 
-      // ---- log / info ----
+      // logging / info
       case "LOG": {
         const entry = { time: this.time, pid: pcb.pid, msg: req.msg };
         this.logs.push(entry);
@@ -233,7 +237,7 @@ export class Kernel {
         return pcb.pid;
       }
 
-      // ---- IPC pid-to-pid ----
+      // IPC pid-to-pid
       case "SEND": {
         const { to, message } = req;
         if (!this.mailboxes.has(to)) {
@@ -242,7 +246,6 @@ export class Kernel {
         const msg = { from: pcb.pid, payload: message, time: this.time };
         this.mailboxes.get(to).push(msg);
 
-        // sblocca destinatario se sta aspettando
         for (const other of this.processes) {
           if (
             other.pid === to &&
@@ -279,7 +282,7 @@ export class Kernel {
         }
       }
 
-      // ---- filesystem in RAM ----
+      // VFS
       case "OPEN": {
         const path = req.path;
         const mode = req.mode || "r";
@@ -355,7 +358,6 @@ export class Kernel {
         const fd = req.fd;
         const data = req.data ?? "";
 
-        // stdout/stderr speciali
         if (fd === 1) {
           console.log(`[PID ${pcb.pid} STDOUT]`, String(data));
           pcb.state = ProcessState.READY;
@@ -397,7 +399,7 @@ export class Kernel {
         return 0;
       }
 
-      // ---- gestione processo ----
+      // process control
       case "EXEC": {
         const { programName, args } = req;
         const prog = this.programs.get(programName);
@@ -430,14 +432,14 @@ export class Kernel {
         return val;
       }
 
-      // ---- networking a porte ----
+      // networking over ports
       case "LISTEN": {
-        const port = req.port;
-        if (this.ports.has(port)) {
+        const portKey = this._normalizePortKey(req.port);
+        if (this.ports.has(portKey)) {
           pcb.state = ProcessState.READY;
-          return false; // già in uso
+          return false;
         }
-        this.ports.set(port, {
+        this.ports.set(portKey, {
           ownerPid: pcb.pid,
           queue: [],
         });
@@ -446,10 +448,10 @@ export class Kernel {
       }
 
       case "UNLISTEN": {
-        const port = req.port;
-        const entry = this.ports.get(port);
+        const portKey = this._normalizePortKey(req.port);
+        const entry = this.ports.get(portKey);
         if (entry && entry.ownerPid === pcb.pid) {
-          this.ports.delete(port);
+          this.ports.delete(portKey);
           pcb.state = ProcessState.READY;
           return true;
         }
@@ -458,8 +460,8 @@ export class Kernel {
       }
 
       case "SEND_PORT": {
-        const port = req.port;
-        const entry = this.ports.get(port);
+        const portKey = this._normalizePortKey(req.port);
+        const entry = this.ports.get(portKey);
         if (!entry) {
           pcb.state = ProcessState.READY;
           return false;
@@ -470,13 +472,12 @@ export class Kernel {
           time: this.time,
         });
 
-        // prova a svegliare il server se è bloccato su quella porta
         for (const other of this.processes) {
           if (
             other.pid === entry.ownerPid &&
             other.state === ProcessState.BLOCKED &&
             other.blockReason === "recv_port" &&
-            other.waitPort === port
+            other.waitPort === portKey
           ) {
             const msg = entry.queue.shift();
             if (msg) {
@@ -494,20 +495,19 @@ export class Kernel {
       }
 
       case "RECV_PORT": {
-        const port = req.port;
+        const portKey = this._normalizePortKey(req.port);
         const timeoutMs = req.timeoutMs;
-        const entry = this.ports.get(port);
+        const entry = this.ports.get(portKey);
 
         if (!entry || entry.ownerPid !== pcb.pid) {
           pcb.state = ProcessState.READY;
-          return null; // non proprietario
+          return null;
         }
 
         if (entry.queue.length === 0) {
-          // nessun messaggio: blocca (con o senza timeout)
           pcb.state = ProcessState.BLOCKED;
           pcb.blockReason = "recv_port";
-          pcb.waitPort = port;
+          pcb.waitPort = portKey;
           pcb.waitTimeoutAt =
             timeoutMs == null ? null : this.time + timeoutMs;
           return null;
@@ -518,7 +518,7 @@ export class Kernel {
         }
       }
 
-      // ---- spawn da dentro un processo ----
+      // spawn from inside
       case "SPAWN": {
         const { programName, args, priority } = req;
         const prog = this.programs.get(programName);
@@ -535,8 +535,26 @@ export class Kernel {
         return childPid;
       }
 
+      // kernel info
+      case "KINFO": {
+        switch (req.kind) {
+          case "PS":
+            pcb.state = ProcessState.READY;
+            return this.getProcessTable();
+          case "PORTS":
+            pcb.state = ProcessState.READY;
+            return this.getPortsTable();
+          case "VFS":
+            pcb.state = ProcessState.READY;
+            return this.listFiles();
+          default:
+            pcb.state = ProcessState.READY;
+            return null;
+        }
+      }
+
       default: {
-        console.warn("Syscall sconosciuta:", req);
+        console.warn("Unknown syscall:", req);
         pcb.state = ProcessState.READY;
         return null;
       }
@@ -557,7 +575,7 @@ export class Kernel {
     }
   }
 
-  // ---------- API per la UI ----------
+  // ---------- UI helpers ----------
 
   getProcessTable() {
     return this.processes.map((p) => ({
@@ -574,8 +592,8 @@ export class Kernel {
   }
 
   getPortsTable() {
-    return Array.from(this.ports.entries()).map(([port, info]) => ({
-      port,
+    return Array.from(this.ports.entries()).map(([portKey, info]) => ({
+      port: portKey,
       ownerPid: info.ownerPid,
       queueLength: info.queue.length,
     }));
@@ -596,25 +614,24 @@ export class Kernel {
 }
 
 // ----------------------------------------------------------
-// Programmi di esempio: echo server, echo client, shell base
+// Programs: echo server/client, shell, ps, ls, netstat
 // ----------------------------------------------------------
 
 export function* echoServer(sys, port) {
   const ok = yield sys.listen(port);
   if (!ok) {
-    yield sys.log(`Echo: impossibile ascoltare sulla porta ${port}`);
+    yield sys.log(`Echo: unable to listen on port ${port}`);
     yield sys.exit(1);
   }
-  yield sys.log(`Echo server in ascolto su port ${port}`);
+  yield sys.log(`Echo server listening on port ${port}`);
 
   while (true) {
-    const msg = yield sys.recvFromPort(port); // blocca
+    const msg = yield sys.recvFromPort(port); // blocks
     if (!msg) continue;
     const { fromPid, payload } = msg;
     yield sys.log(
-      `Echo server: da PID ${fromPid} -> ${JSON.stringify(payload)}`
+      `Echo server: from PID ${fromPid} -> ${JSON.stringify(payload)}`
     );
-    // rispondi via IPC
     yield sys.send(fromPid, {
       type: "ECHO_REPLY",
       port,
@@ -625,32 +642,30 @@ export function* echoServer(sys, port) {
 
 export function* echoClient(sys, port, message) {
   const myPid = yield sys.getPid();
-  yield sys.log(`Client ${myPid}: invio a port ${port}: ${message}`);
+  yield sys.log(`Client ${myPid}: send to port ${port}: ${message}`);
 
   yield sys.sendToPort(port, { text: message, from: myPid });
 
   const reply = yield sys.recv();
   if (reply && reply.payload && reply.payload.type === "ECHO_REPLY") {
     yield sys.log(
-      `Client ${myPid}: risposta = ${JSON.stringify(
-        reply.payload.payload
-      )}`
+      `Client ${myPid}: reply = ${JSON.stringify(reply.payload.payload)}`
     );
   } else {
-    yield sys.log(`Client ${myPid}: nessuna risposta valida`);
+    yield sys.log(`Client ${myPid}: no valid reply`);
   }
   yield sys.exit(0);
 }
 
-// Shell minimale che riceve comandi su una porta e spawna programmi per nome
+// Shell listening on port 9999: receives a line and spawn a program
 export function* shellProcess(sys) {
   const PORT = 9999;
   const ok = yield sys.listen(PORT);
   if (!ok) {
-    yield sys.log(`Shell: porta ${PORT} già in uso`);
+    yield sys.log(`Shell: port ${PORT} already in use`);
     yield sys.exit(1);
   }
-  yield sys.log(`Shell pronta su port ${PORT}`);
+  yield sys.log(`Shell ready on port ${PORT}`);
 
   while (true) {
     const msg = yield sys.recvFromPort(PORT);
@@ -682,4 +697,36 @@ export function* shellProcess(sys) {
   }
 }
 
-// Puoi riusare cat/echo-file del kernel precedente oppure aggiungerli qui.
+// ps: print process table
+export function* psProgram(sys) {
+  const table = yield sys.kernelInfo("PS");
+  yield sys.log("=== ps ===");
+  for (const p of table) {
+    yield sys.log(
+      `pid=${p.pid} name=${p.name} prio=${p.priority} state=${p.state} block=${p.blockReason || "-"}`
+    );
+  }
+  yield sys.exit(0);
+}
+
+// ls: print VFS
+export function* lsProgram(sys) {
+  const files = yield sys.kernelInfo("VFS");
+  yield sys.log("=== ls (VFS) ===");
+  for (const f of files) {
+    yield sys.log(`${f.path} (${f.size} bytes)`);
+  }
+  yield sys.exit(0);
+}
+
+// netstat: print ports
+export function* netstatProgram(sys) {
+  const ports = yield sys.kernelInfo("PORTS");
+  yield sys.log("=== netstat ===");
+  for (const p of ports) {
+    yield sys.log(
+      `port=${p.port} ownerPid=${p.ownerPid} queue=${p.queueLength}`
+    );
+  }
+  yield sys.exit(0);
+}
