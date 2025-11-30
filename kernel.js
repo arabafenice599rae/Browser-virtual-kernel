@@ -17,11 +17,38 @@ export class Kernel {
     this.mailboxes = new Map(); // pid -> messages
     this.vfs = new Map(); // path -> string
     this.programs = new Map(); // name -> generator factory
-
-    this.ports = new Map(); // portKey (string) -> { ownerPid, queue: [] }
+    this.ports = new Map(); // portKey -> { ownerPid, queue: [] }
     this.logs = [];
 
-    this.vfs.set("/etc/motd", "Benvenuto nel mini-kernel in JS!\n");
+    // load VFS from localStorage if available
+    this._loadVfsFromStorage();
+    if (!this.vfs.has("/etc/motd")) {
+      this.vfs.set("/etc/motd", "Benvenuto nel mini-kernel in JS!\n");
+    }
+  }
+
+  // -------- VFS persistence --------
+
+  _saveVfsToStorage() {
+    try {
+      if (typeof localStorage === "undefined") return;
+      const obj = Object.fromEntries(this.vfs.entries());
+      localStorage.setItem("bvkernel_vfs", JSON.stringify(obj));
+    } catch (e) {
+      console.warn("VFS save failed:", e);
+    }
+  }
+
+  _loadVfsFromStorage() {
+    try {
+      if (typeof localStorage === "undefined") return;
+      const raw = localStorage.getItem("bvkernel_vfs");
+      if (!raw) return;
+      const obj = JSON.parse(raw);
+      this.vfs = new Map(Object.entries(obj));
+    } catch (e) {
+      console.warn("VFS load failed:", e);
+    }
   }
 
   // ---------- Program registration ----------
@@ -118,6 +145,13 @@ export class Kernel {
 
       // kernel info (for ps/ls/netstat)
       kernelInfo: (kind) => ({ type: "KINFO", kind }),
+
+      // kill / signals
+      kill: (targetPid, signal = "TERM") => ({
+        type: "KILL",
+        targetPid,
+        signal,
+      }),
     };
   }
 
@@ -312,6 +346,7 @@ export class Kernel {
             pos: 0,
             mode,
           });
+          this._saveVfsToStorage();
           pcb.state = ProcessState.READY;
           return fd;
         }
@@ -325,6 +360,7 @@ export class Kernel {
             pos: content.length,
             mode,
           });
+          this._saveVfsToStorage();
           pcb.state = ProcessState.READY;
           return fd;
         }
@@ -389,6 +425,7 @@ export class Kernel {
 
         entry.pos = start + text.length;
         this.vfs.set(entry.path, content);
+        this._saveVfsToStorage();
         pcb.state = ProcessState.READY;
         return text.length;
       }
@@ -553,6 +590,27 @@ export class Kernel {
         }
       }
 
+      // kill / signals
+      case "KILL": {
+        const targetPid = req.targetPid;
+        const signal = (req.signal || "TERM").toUpperCase();
+        const target = this.processes.find((p) => p.pid === targetPid);
+
+        pcb.state = ProcessState.READY;
+
+        if (!target) {
+          return false;
+        }
+
+        if (signal === "TERM" || signal === "KILL") {
+          target.exitCode = signal === "KILL" ? -9 : -15;
+          target.state = ProcessState.TERMINATED;
+          return true;
+        }
+
+        return false;
+      }
+
       default: {
         console.warn("Unknown syscall:", req);
         pcb.state = ProcessState.READY;
@@ -614,7 +672,8 @@ export class Kernel {
 }
 
 // ----------------------------------------------------------
-// Programs: echo server/client, shell, ps, ls, netstat
+// Programs: echo server/client, shell, ps, ls, netstat, help,
+// kill, cat
 // ----------------------------------------------------------
 
 export function* echoServer(sys, port) {
@@ -657,7 +716,7 @@ export function* echoClient(sys, port, message) {
   yield sys.exit(0);
 }
 
-// Shell listening on port 9999: receives a line and spawn a program
+// Shell listening on port 9999
 export function* shellProcess(sys) {
   const PORT = 9999;
   const ok = yield sys.listen(PORT);
@@ -703,7 +762,9 @@ export function* psProgram(sys) {
   yield sys.log("=== ps ===");
   for (const p of table) {
     yield sys.log(
-      `pid=${p.pid} name=${p.name} prio=${p.priority} state=${p.state} block=${p.blockReason || "-"}`
+      `pid=${p.pid} name=${p.name} prio=${p.priority} state=${p.state} block=${
+        p.blockReason || "-"
+      }`
     );
   }
   yield sys.exit(0);
@@ -728,5 +789,70 @@ export function* netstatProgram(sys) {
       `port=${p.port} ownerPid=${p.ownerPid} queue=${p.queueLength}`
     );
   }
+  yield sys.exit(0);
+}
+
+// help
+export function* helpProgram(sys) {
+  yield sys.log("=== help ===");
+  yield sys.log("Available commands:");
+  yield sys.log("  echo-client <port> <msg>   - send message to a server");
+  yield sys.log("  echo-server <port>        - start echo server on port");
+  yield sys.log("  ps                        - show process table");
+  yield sys.log("  ls                        - list virtual file system");
+  yield sys.log("  netstat                   - show open ports");
+  yield sys.log("  cat <path>                - print file contents");
+  yield sys.log("  kill <pid> [SIGNAL]       - terminate a process");
+  yield sys.exit(0);
+}
+
+// kill
+export function* killProgram(sys, pidStr, signalName) {
+  if (!pidStr) {
+    yield sys.log("Usage: kill <pid> [SIGNAL]");
+    yield sys.exit(1);
+  }
+
+  const pid = Number(pidStr);
+  if (!Number.isInteger(pid)) {
+    yield sys.log(`kill: invalid pid: ${pidStr}`);
+    yield sys.exit(1);
+  }
+
+  const signal = (signalName || "TERM").toUpperCase();
+  const ok = yield sys.kill(pid, signal);
+
+  if (ok) {
+    yield sys.log(`kill: sent ${signal} to pid ${pid}`);
+    yield sys.exit(0);
+  } else {
+    yield sys.log(`kill: no such pid ${pid}`);
+    yield sys.exit(1);
+  }
+}
+
+// cat
+export function* catProgram(sys, path) {
+  const target = path || "/etc/motd";
+  const fd = yield sys.open(target, "r");
+  if (fd < 0) {
+    yield sys.log(`cat: cannot open ${target}`);
+    yield sys.exit(1);
+  }
+
+  yield sys.log(`=== cat ${target} ===`);
+  while (true) {
+    const chunk = yield sys.read(fd, 256);
+    if (!chunk) break;
+    const text = String(chunk);
+    const lines = text.split("\n");
+    for (const line of lines) {
+      if (line.length > 0) {
+        yield sys.log(line);
+      }
+    }
+  }
+
+  yield sys.close(fd);
   yield sys.exit(0);
 }
