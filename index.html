@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Browser Virtual Kernel</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 1000px;
+        margin: 20px auto;
+      }
+      h1 {
+        margin-bottom: 0;
+      }
+      small {
+        color: #555;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        margin-top: 10px;
+      }
+      th,
+      td {
+        border: 1px solid #ccc;
+        padding: 4px 8px;
+        text-align: left;
+        font-size: 13px;
+      }
+      button {
+        margin: 4px;
+        padding: 4px 8px;
+      }
+      pre {
+        background: #111;
+        color: #0f0;
+        padding: 8px;
+        max-height: 200px;
+        overflow-y: auto;
+        font-size: 12px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        align-items: flex-start;
+      }
+      .shell {
+        font-family: monospace;
+        background: #1e1e1e;
+        color: #00ff00;
+        padding: 8px;
+        border-radius: 4px;
+      }
+      .shell-history {
+        max-height: 140px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+        margin-bottom: 4px;
+      }
+      .shell-input {
+        background: transparent;
+        border: none;
+        outline: none;
+        color: #00ff00;
+        width: 80%;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Browser Virtual Kernel</h1>
+    <small>Kernel JS avanzato: processi, VFS, porte, shell – tutto nel browser.</small>
+
+    <h2>Controlli</h2>
+    <div>
+      <button id="btnAuto">Start/stop kernel</button>
+      <button id="btnSpawnEchoClient">Spawn echo-client</button>
+    </div>
+
+    <h2>Shell</h2>
+    <div class="shell">
+      <div id="shellHistory" class="shell-history"></div>
+      <div>
+        <span>$ </span>
+        <input
+          id="shellInput"
+          class="shell-input"
+          autocomplete="off"
+          placeholder="es: echo-client 8080 ciao"
+        />
+      </div>
+    </div>
+    <p style="font-size: 12px; margin-top: 4px;">
+      I comandi vengono inviati alla shell del kernel sulla porta 9999.<br />
+      I risultati compaiono nei log in basso.
+    </p>
+
+    <div class="grid">
+      <section>
+        <h2>Processi</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>PID</th>
+              <th>Nome</th>
+              <th>Priorità</th>
+              <th>Stato</th>
+              <th>Blocco</th>
+              <th>Exit</th>
+              <th>Età (s)</th>
+            </tr>
+          </thead>
+          <tbody id="processTableBody"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Porte</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Port</th>
+              <th>Owner PID</th>
+              <th>Queue</th>
+            </tr>
+          </thead>
+          <tbody id="portsTableBody"></tbody>
+        </table>
+
+        <h2>VFS</h2>
+        <ul id="vfsList"></ul>
+      </section>
+    </div>
+
+    <h2>Log kernel</h2>
+    <pre id="logArea"></pre>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
