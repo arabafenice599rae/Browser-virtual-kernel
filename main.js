@@ -1,19 +1,6 @@
 // main.js - Bootstrap del kernel + collegamento UI
 
-import {
-  Kernel,
-  echoServer,
-  echoClient,
-  shellProcess,
-  psProgram,
-  lsProgram,
-  netstatProgram,
-  helpProgram,
-  killProgram,
-  catProgram,
-  echoFileProgram,
-  rmProgram,
-} from "./kernel.js";
+import { Kernel, echoServer, echoClient, shellProcess } from "./kernel.js";
 
 // ––––– BOOT DEL KERNEL –––––
 
@@ -23,14 +10,6 @@ const kernel = new Kernel({ tickMs: 50 });
 kernel.registerProgram("echo-server", echoServer);
 kernel.registerProgram("echo-client", echoClient);
 kernel.registerProgram("shell", shellProcess);
-kernel.registerProgram("ps", psProgram);
-kernel.registerProgram("ls", lsProgram);
-kernel.registerProgram("netstat", netstatProgram);
-kernel.registerProgram("help", helpProgram);
-kernel.registerProgram("kill", killProgram);
-kernel.registerProgram("cat", catProgram);
-kernel.registerProgram("echo-file", echoFileProgram);
-kernel.registerProgram("rm", rmProgram);
 
 // Avvia shell (porta 9999) e echo server (porta 8080)
 kernel.spawn(shellProcess, {
@@ -73,21 +52,17 @@ function renderProcesses() {
     const tr = document.createElement("tr");
     const ageSec = ((now - p.spawnTime) / 1000).toFixed(1);
 
+    // Determina classe priorità
     let priorityClass = "priority-low";
     if (p.priority >= 3) priorityClass = "priority-high";
     else if (p.priority >= 2) priorityClass = "priority-medium";
-
-    let blockLabel = p.blockReason || "-";
-    if (p.blockReason === "recv_port") blockLabel = "WAIT_PORT";
-    if (p.blockReason === "recv") blockLabel = "WAIT_MSG";
-    if (p.blockReason === "sleep") blockLabel = "SLEEP";
 
     tr.innerHTML = `
       <td>${p.pid}</td>
       <td><strong>${p.name}</strong></td>
       <td class="${priorityClass}">${p.priority}</td>
       <td><span class="state-badge state-${p.state}">${p.state}</span></td>
-      <td>${blockLabel}</td>
+      <td>${p.blockReason || "-"}</td>
       <td>${p.exitCode ?? "-"}</td>
       <td>${ageSec}s</td>
     `;
@@ -126,7 +101,12 @@ function renderVFS() {
 function renderLogs() {
   const logs = kernel.getLogs();
   logArea.textContent = logs
-    .map((l) => `[t=${l.time}] [PID ${l.pid}] ${l.msg}`)
+    .map(
+      (l) =>
+        `[${new Date(l.time).toISOString().substr(11, 8)}] [PID ${l.pid}] ${
+          l.msg
+        }`
+    )
     .join("\n");
   logArea.scrollTop = logArea.scrollHeight;
 }
@@ -136,17 +116,13 @@ function updateStatsDisplay() {
   const ports = kernel.getPortsTable();
   const files = kernel.listFiles();
 
-  const uptime = startTime
-    ? Math.floor((Date.now() - startTime) / 1000)
-    : 0;
+  const uptime = startTime ? Math.floor((Date.now() - startTime) / 1000) : 0;
   const uptimeStr =
     uptime >= 60
       ? `${Math.floor(uptime / 60)}m ${uptime % 60}s`
       : `${uptime}s`;
 
-  if (window.updateStats) {
-    window.updateStats(procs.length, ports.length, files.length, uptimeStr);
-  }
+  window.updateStats(procs.length, ports.length, files.length, uptimeStr);
 }
 
 // Shell UI history
@@ -173,21 +149,23 @@ function oneTick() {
 
 function makeShellClientProgram(line) {
   return function* shellClient(sys) {
-    const myPid = yield sys.getPid();
-    yield sys.log(`Shell client ${myPid}: comando "${line}"`);
+    const myPid = yield* sys.getPid();
+    yield* sys.log(`Shell client ${myPid}: comando "${line}"`);
 
-    yield sys.sendToPort(9999, { command: line, from: myPid });
+    // Manda alla shell (porta 9999)
+    yield* sys.sendToPort(9999, { command: line, from: myPid });
 
-    const reply = yield sys.recv();
+    // Aspetta risposta via IPC
+    const reply = yield* sys.recv();
     if (reply && reply.payload && reply.payload.type === "SHELL_RESULT") {
       const out = reply.payload.output;
-      yield sys.log(`Shell result: ${out}`);
+      yield* sys.log(`Shell result: ${out}`);
       appendShellHistory(`→ ${out}`);
     } else {
-      yield sys.log("Shell result: nessuna risposta");
+      yield* sys.log("Shell result: nessuna risposta");
       appendShellHistory("→ nessuna risposta");
     }
-    yield sys.exit(0);
+    yield* sys.exit(0);
   };
 }
 
@@ -198,12 +176,12 @@ btnAuto.onclick = () => {
     autoId = setInterval(oneTick, 50);
     startTime = Date.now();
     btnAuto.innerHTML = "⏸️ Stop Kernel";
-    window.updateStatus && window.updateStatus(true);
+    window.updateStatus(true);
   } else {
     clearInterval(autoId);
     autoId = null;
     btnAuto.innerHTML = "▶️ Start Kernel";
-    window.updateStatus && window.updateStatus(false);
+    window.updateStatus(false);
   }
 };
 
