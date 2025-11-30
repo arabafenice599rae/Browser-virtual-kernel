@@ -8,6 +8,9 @@ import {
   psProgram,
   lsProgram,
   netstatProgram,
+  helpProgram,
+  killProgram,
+  catProgram,
 } from "./kernel.js";
 
 // ––––– BOOT DEL KERNEL –––––
@@ -21,6 +24,9 @@ kernel.registerProgram("shell", shellProcess);
 kernel.registerProgram("ps", psProgram);
 kernel.registerProgram("ls", lsProgram);
 kernel.registerProgram("netstat", netstatProgram);
+kernel.registerProgram("help", helpProgram);
+kernel.registerProgram("kill", killProgram);
+kernel.registerProgram("cat", catProgram);
 
 // Avvia shell (porta 9999) e echo server (porta 8080)
 kernel.spawn(shellProcess, {
@@ -68,12 +74,18 @@ function renderProcesses() {
     if (p.priority >= 3) priorityClass = "priority-high";
     else if (p.priority >= 2) priorityClass = "priority-medium";
 
+    // Etichetta di blocco più leggibile
+    let blockLabel = p.blockReason || "-";
+    if (p.blockReason === "recv_port") blockLabel = "WAIT_PORT";
+    if (p.blockReason === "recv") blockLabel = "WAIT_MSG";
+    if (p.blockReason === "sleep") blockLabel = "SLEEP";
+
     tr.innerHTML = `
       <td>${p.pid}</td>
       <td><strong>${p.name}</strong></td>
       <td class="${priorityClass}">${p.priority}</td>
       <td><span class="state-badge state-${p.state}">${p.state}</span></td>
-      <td>${p.blockReason || "-"}</td>
+      <td>${blockLabel}</td>
       <td>${p.exitCode ?? "-"}</td>
       <td>${ageSec}s</td>
     `;
@@ -111,7 +123,6 @@ function renderVFS() {
 
 function renderLogs() {
   const logs = kernel.getLogs();
-  // l.time è il tempo logico del kernel (ms), non un timestamp reale
   logArea.textContent = logs
     .map((l) => `[t=${l.time}] [PID ${l.pid}] ${l.msg}`)
     .join("\n");
