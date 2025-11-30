@@ -1,5 +1,5 @@
 # Browser-virtual-kernel
-# browser-virtual-kernel
+
 
 Advanced virtual kernel that runs entirely in the **browser**:
 
