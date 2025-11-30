@@ -1,4 +1,5 @@
-// main.js
+// main.js - Bootstrap del kernel + collegamento UI
+
 import {
   Kernel,
   echoServer,
@@ -9,11 +10,11 @@ import {
   netstatProgram,
 } from "./kernel.js";
 
-// ---------- Kernel boot ----------
+// ––––– BOOT DEL KERNEL –––––
 
 const kernel = new Kernel({ tickMs: 50 });
 
-// register programs
+// Registra i programmi userland
 kernel.registerProgram("echo-server", echoServer);
 kernel.registerProgram("echo-client", echoClient);
 kernel.registerProgram("shell", shellProcess);
@@ -21,20 +22,21 @@ kernel.registerProgram("ps", psProgram);
 kernel.registerProgram("ls", lsProgram);
 kernel.registerProgram("netstat", netstatProgram);
 
-// start shell (port 9999) and echo server on 8080
+// Avvia shell (porta 9999) e echo server (porta 8080)
 kernel.spawn(shellProcess, {
   name: "shell",
   priority: 2,
 });
+
 kernel.spawn((sys) => echoServer(sys, 8080), {
   name: "echo-server",
   priority: 2,
 });
 
-// export for debug
+// Esporta per debug da console
 window.kernel = kernel;
 
-// ---------- DOM refs ----------
+// ––––– UI: riferimenti DOM –––––
 
 const processTableBody = document.getElementById("processTableBody");
 const portsTableBody = document.getElementById("portsTableBody");
@@ -43,13 +45,15 @@ const logArea = document.getElementById("logArea");
 
 const btnAuto = document.getElementById("btnAuto");
 const btnSpawnEchoClient = document.getElementById("btnSpawnEchoClient");
+const btnClearLogs = document.getElementById("btnClearLogs");
 
 const shellHistoryEl = document.getElementById("shellHistory");
 const shellInputEl = document.getElementById("shellInput");
 
 let autoId = null;
+let startTime = null;
 
-// ---------- Render helpers ----------
+// ––––– Funzioni di render –––––
 
 function renderProcesses() {
   const procs = kernel.getProcessTable();
@@ -58,14 +62,20 @@ function renderProcesses() {
   for (const p of procs) {
     const tr = document.createElement("tr");
     const ageSec = ((now - p.spawnTime) / 1000).toFixed(1);
+
+    // Determina classe priorità
+    let priorityClass = "priority-low";
+    if (p.priority >= 3) priorityClass = "priority-high";
+    else if (p.priority >= 2) priorityClass = "priority-medium";
+
     tr.innerHTML = `
       <td>${p.pid}</td>
-      <td>${p.name}</td>
-      <td>${p.priority}</td>
-      <td>${p.state}</td>
+      <td><strong>${p.name}</strong></td>
+      <td class="${priorityClass}">${p.priority}</td>
+      <td><span class="state-badge state-${p.state}">${p.state}</span></td>
       <td>${p.blockReason || "-"}</td>
       <td>${p.exitCode ?? "-"}</td>
-      <td>${ageSec}</td>
+      <td>${ageSec}s</td>
     `;
     processTableBody.appendChild(tr);
   }
@@ -77,9 +87,13 @@ function renderPorts() {
   for (const p of ports) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${p.port}</td>
-      <td>${p.ownerPid}</td>
-      <td>${p.queueLength}</td>
+      <td><code>${p.port}</code></td>
+      <td>PID ${p.ownerPid}</td>
+      <td>${
+        p.queueLength > 0
+          ? `<span class="state-badge state-READY">${p.queueLength}</span>`
+          : "-"
+      }</td>
     `;
     portsTableBody.appendChild(tr);
   }
@@ -90,18 +104,39 @@ function renderVFS() {
   vfsList.innerHTML = "";
   for (const f of files) {
     const li = document.createElement("li");
-    li.innerHTML = `<strong>${f.path}</strong> (${f.size} bytes) – <code>${f.preview}</code>`;
+    li.innerHTML = `<strong>${f.path}</strong> <span style="color: var(--text-secondary)">(${f.size} bytes)</span> — <code>${f.preview}</code>`;
     vfsList.appendChild(li);
   }
 }
 
 function renderLogs() {
   const logs = kernel.getLogs();
+  // l.time è il tempo logico del kernel (ms), non un timestamp reale
   logArea.textContent = logs
-    .map((l) => `[t=${l.time}] [PID=${l.pid}] ${l.msg}`)
+    .map((l) => `[t=${l.time}] [PID ${l.pid}] ${l.msg}`)
     .join("\n");
+  logArea.scrollTop = logArea.scrollHeight;
 }
 
+function updateStatsDisplay() {
+  const procs = kernel.getProcessTable();
+  const ports = kernel.getPortsTable();
+  const files = kernel.listFiles();
+
+  const uptime = startTime
+    ? Math.floor((Date.now() - startTime) / 1000)
+    : 0;
+  const uptimeStr =
+    uptime >= 60
+      ? `${Math.floor(uptime / 60)}m ${uptime % 60}s`
+      : `${uptime}s`;
+
+  if (window.updateStats) {
+    window.updateStats(procs.length, ports.length, files.length, uptimeStr);
+  }
+}
+
+// Shell UI history
 function appendShellHistory(line) {
   const div = document.createElement("div");
   div.textContent = line;
@@ -109,7 +144,7 @@ function appendShellHistory(line) {
   shellHistoryEl.scrollTop = shellHistoryEl.scrollHeight;
 }
 
-// ---------- Kernel tick ----------
+// ––––– Kernel tick + UI refresh –––––
 
 function oneTick() {
   kernel.tick();
@@ -118,38 +153,53 @@ function oneTick() {
   renderPorts();
   renderVFS();
   renderLogs();
+  updateStatsDisplay();
 }
 
-// ---------- Shell client program ----------
+// ––––– Programma: shell-client per un comando –––––
 
 function makeShellClientProgram(line) {
   return function* shellClient(sys) {
     const myPid = yield sys.getPid();
-    yield sys.log(`Shell client ${myPid}: command "${line}"`);
+    yield sys.log(`Shell client ${myPid}: comando "${line}"`);
+
+    // Manda alla shell (porta 9999)
     yield sys.sendToPort(9999, { command: line, from: myPid });
 
+    // Aspetta risposta via IPC
     const reply = yield sys.recv();
     if (reply && reply.payload && reply.payload.type === "SHELL_RESULT") {
       const out = reply.payload.output;
       yield sys.log(`Shell result: ${out}`);
+      appendShellHistory(`→ ${out}`);
     } else {
-      yield sys.log("Shell result: no reply");
+      yield sys.log("Shell result: nessuna risposta");
+      appendShellHistory("→ nessuna risposta");
     }
     yield sys.exit(0);
   };
 }
 
-// ---------- UI events ----------
+// ––––– Eventi UI –––––
 
 btnAuto.onclick = () => {
   if (autoId === null) {
     autoId = setInterval(oneTick, 50);
-    btnAuto.textContent = "Stop kernel";
+    startTime = Date.now();
+    btnAuto.innerHTML = "⏸️ Stop Kernel";
+    window.updateStatus && window.updateStatus(true);
   } else {
     clearInterval(autoId);
     autoId = null;
-    btnAuto.textContent = "Start/stop kernel";
+    btnAuto.innerHTML = "▶️ Start Kernel";
+    window.updateStatus && window.updateStatus(false);
   }
+};
+
+btnClearLogs.onclick = () => {
+  kernel.logs = [];
+  renderLogs();
+  appendShellHistory("→ Logs cleared");
 };
 
 btnSpawnEchoClient.onclick = () => {
@@ -177,12 +227,33 @@ shellInputEl.addEventListener("keydown", (e) => {
   }
 });
 
-// ---------- Initial render ----------
+// Keyboard shortcuts
+document.addEventListener("keydown", (e) => {
+  // Ctrl/Cmd + L = Clear logs
+  if ((e.ctrlKey || e.metaKey) && e.key === "l") {
+    e.preventDefault();
+    kernel.logs = [];
+    renderLogs();
+    appendShellHistory("→ Logs cleared (Ctrl+L)");
+  }
+
+  // Ctrl/Cmd + K = Focus shell
+  if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+    e.preventDefault();
+    shellInputEl.focus();
+  }
+});
+
+// ––––– Primo render –––––
 
 renderProcesses();
 renderPorts();
 renderVFS();
 renderLogs();
-appendShellHistory(
-  "Shell ready. Example: echo-client 8080 hello, ps, ls, netstat"
-);
+updateStatsDisplay();
+appendShellHistory("🚀 Shell ready. Type 'help' for commands");
+appendShellHistory("📌 Shortcuts: Ctrl+L (clear logs), Ctrl+K (focus shell)");
+appendShellHistory("");
+
+// Focus shell input on load
+setTimeout(() => shellInputEl.focus(), 100);
