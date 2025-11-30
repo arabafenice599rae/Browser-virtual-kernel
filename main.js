@@ -11,6 +11,8 @@ import {
   helpProgram,
   killProgram,
   catProgram,
+  echoFileProgram,
+  rmProgram,
 } from "./kernel.js";
 
 // ––––– BOOT DEL KERNEL –––––
@@ -27,6 +29,8 @@ kernel.registerProgram("netstat", netstatProgram);
 kernel.registerProgram("help", helpProgram);
 kernel.registerProgram("kill", killProgram);
 kernel.registerProgram("cat", catProgram);
+kernel.registerProgram("echo-file", echoFileProgram);
+kernel.registerProgram("rm", rmProgram);
 
 // Avvia shell (porta 9999) e echo server (porta 8080)
 kernel.spawn(shellProcess, {
@@ -69,12 +73,10 @@ function renderProcesses() {
     const tr = document.createElement("tr");
     const ageSec = ((now - p.spawnTime) / 1000).toFixed(1);
 
-    // Determina classe priorità
     let priorityClass = "priority-low";
     if (p.priority >= 3) priorityClass = "priority-high";
     else if (p.priority >= 2) priorityClass = "priority-medium";
 
-    // Etichetta di blocco più leggibile
     let blockLabel = p.blockReason || "-";
     if (p.blockReason === "recv_port") blockLabel = "WAIT_PORT";
     if (p.blockReason === "recv") blockLabel = "WAIT_MSG";
@@ -174,10 +176,8 @@ function makeShellClientProgram(line) {
     const myPid = yield sys.getPid();
     yield sys.log(`Shell client ${myPid}: comando "${line}"`);
 
-    // Manda alla shell (porta 9999)
     yield sys.sendToPort(9999, { command: line, from: myPid });
 
-    // Aspetta risposta via IPC
     const reply = yield sys.recv();
     if (reply && reply.payload && reply.payload.type === "SHELL_RESULT") {
       const out = reply.payload.output;
