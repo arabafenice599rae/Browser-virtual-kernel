@@ -1,141 +1,455 @@
 <!DOCTYPE html>
-<html lang="it">
+
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <title>Browser Virtual Kernel</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      body {
-        font-family: system-ui, sans-serif;
-        max-width: 1000px;
-        margin: 20px auto;
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
       }
-      h1 {
-        margin-bottom: 0;
-      }
-      small {
-        color: #555;
-      }
-      table {
-        border-collapse: collapse;
-        width: 100%;
-        margin-top: 10px;
-      }
-      th,
-      td {
-        border: 1px solid #ccc;
-        padding: 4px 8px;
-        text-align: left;
-        font-size: 13px;
-      }
-      button {
-        margin: 4px;
-        padding: 4px 8px;
-      }
-      pre {
-        background: #111;
-        color: #0f0;
-        padding: 8px;
-        max-height: 200px;
-        overflow-y: auto;
-        font-size: 12px;
-      }
-      .grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 16px;
-        align-items: flex-start;
-      }
-      .shell {
-        font-family: monospace;
-        background: #1e1e1e;
-        color: #00ff00;
-        padding: 8px;
-        border-radius: 4px;
-      }
-      .shell-history {
-        max-height: 140px;
-        overflow-y: auto;
-        white-space: pre-wrap;
-        margin-bottom: 4px;
-      }
-      .shell-input {
-        background: transparent;
-        border: none;
-        outline: none;
-        color: #00ff00;
-        width: 80%;
-      }
-    </style>
+
+```
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+    background: #0d1117;
+    color: #c9d1d9;
+    padding: 12px;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  .container {
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+
+  h1 {
+    font-size: clamp(1.5rem, 4vw, 2rem);
+    color: #58a6ff;
+    margin-bottom: 4px;
+  }
+
+  h2 {
+    font-size: clamp(1rem, 3vw, 1.25rem);
+    color: #58a6ff;
+    margin-top: 16px;
+    margin-bottom: 8px;
+  }
+
+  small {
+    color: #8b949e;
+    font-size: clamp(0.75rem, 2vw, 0.875rem);
+    display: block;
+    margin-bottom: 12px;
+  }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 12px 0;
+    padding: 12px;
+    background: #161b22;
+    border-radius: 6px;
+    border: 1px solid #30363d;
+  }
+
+  button {
+    padding: 8px 16px;
+    background: #238636;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: clamp(0.75rem, 2vw, 0.875rem);
+    font-weight: 500;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 120px;
+  }
+
+  button:hover {
+    background: #2ea043;
+  }
+
+  button:active {
+    background: #1a7f37;
+  }
+
+  .shell {
+    font-family: "Courier New", Consolas, monospace;
+    background: #0d1117;
+    color: #00ff00;
+    padding: 12px;
+    border-radius: 6px;
+    border: 1px solid #30363d;
+    margin: 8px 0;
+    font-size: clamp(0.7rem, 1.8vw, 0.85rem);
+  }
+
+  .shell-history {
+    max-height: clamp(120px, 20vh, 180px);
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin-bottom: 8px;
+  }
+
+  .shell-input-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .shell-prompt {
+    color: #58a6ff;
+    font-weight: bold;
+    flex-shrink: 0;
+  }
+
+  .shell-input {
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #00ff00;
+    flex: 1;
+    font-family: inherit;
+    font-size: inherit;
+    min-width: 0;
+  }
+
+  .help-text {
+    font-size: clamp(0.7rem, 1.8vw, 0.8rem);
+    color: #8b949e;
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+
+  .help-text code {
+    background: #161b22;
+    padding: 2px 6px;
+    border-radius: 3px;
+    color: #79c0ff;
+    font-size: 0.9em;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-top: 12px;
+  }
+
+  @media (max-width: 900px) {
+    .grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  section {
+    background: #161b22;
+    padding: 12px;
+    border-radius: 6px;
+    border: 1px solid #30363d;
+    min-width: 0;
+  }
+
+  section h2 {
+    margin-top: 0;
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin-top: 8px;
+    font-size: clamp(0.7rem, 1.8vw, 0.8rem);
+    display: block;
+    overflow-x: auto;
+  }
+
+  table thead,
+  table tbody,
+  table tr {
+    display: table;
+    width: 100%;
+    table-layout: fixed;
+  }
+
+  th,
+  td {
+    border: 1px solid #30363d;
+    padding: 6px 8px;
+    text-align: left;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  th {
+    background: #21262d;
+    font-weight: 600;
+    color: #58a6ff;
+    position: sticky;
+    top: 0;
+  }
+
+  tbody {
+    display: block;
+    max-height: clamp(150px, 25vh, 250px);
+    overflow-y: auto;
+  }
+
+  tr:hover {
+    background: #1c2128;
+  }
+
+  /* Larghezze colonne responsive per tabella processi */
+  #processTableBody tr td:nth-child(1),
+  thead tr th:nth-child(1) {
+    width: 8%;
+  }
+  #processTableBody tr td:nth-child(2),
+  thead tr th:nth-child(2) {
+    width: 20%;
+  }
+  #processTableBody tr td:nth-child(3),
+  thead tr th:nth-child(3) {
+    width: 10%;
+  }
+  #processTableBody tr td:nth-child(4),
+  thead tr th:nth-child(4) {
+    width: 15%;
+  }
+  #processTableBody tr td:nth-child(5),
+  thead tr th:nth-child(5) {
+    width: 17%;
+  }
+  #processTableBody tr td:nth-child(6),
+  thead tr th:nth-child(6) {
+    width: 10%;
+  }
+  #processTableBody tr td:nth-child(7),
+  thead tr th:nth-child(7) {
+    width: 12%;
+  }
+
+  /* Larghezze colonne per tabella porte */
+  #portsTableBody tr td:nth-child(1),
+  #portsTableBody + table thead tr th:nth-child(1) {
+    width: 30%;
+  }
+  #portsTableBody tr td:nth-child(2),
+  #portsTableBody + table thead tr th:nth-child(2) {
+    width: 40%;
+  }
+  #portsTableBody tr td:nth-child(3),
+  #portsTableBody + table thead tr th:nth-child(3) {
+    width: 30%;
+  }
+
+  ul {
+    list-style: none;
+    padding: 0;
+    margin: 8px 0 0 0;
+    max-height: clamp(120px, 20vh, 180px);
+    overflow-y: auto;
+  }
+
+  li {
+    padding: 8px;
+    background: #0d1117;
+    margin-bottom: 4px;
+    border-radius: 4px;
+    border: 1px solid #30363d;
+    font-size: clamp(0.7rem, 1.8vw, 0.8rem);
+    word-break: break-all;
+  }
+
+  li strong {
+    color: #58a6ff;
+    display: inline-block;
+    margin-right: 4px;
+  }
+
+  li code {
+    background: #161b22;
+    padding: 2px 6px;
+    border-radius: 3px;
+    color: #79c0ff;
+    font-size: 0.9em;
+    word-break: break-all;
+  }
+
+  pre {
+    background: #0d1117;
+    color: #00ff00;
+    padding: 12px;
+    max-height: clamp(180px, 30vh, 300px);
+    overflow-y: auto;
+    overflow-x: auto;
+    font-size: clamp(0.7rem, 1.8vw, 0.8rem);
+    font-family: "Courier New", Consolas, monospace;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    margin-top: 8px;
+    word-break: break-all;
+    white-space: pre-wrap;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: #0d1117;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #30363d;
+    border-radius: 4px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #484f58;
+  }
+
+  /* Mobile ottimizzazioni */
+  @media (max-width: 600px) {
+    body {
+      padding: 8px;
+    }
+
+    h2 {
+      margin-top: 12px;
+    }
+
+    .controls {
+      flex-direction: column;
+    }
+
+    button {
+      width: 100%;
+      min-width: 0;
+    }
+
+    section {
+      padding: 8px;
+    }
+
+    th,
+    td {
+      padding: 4px 6px;
+    }
+
+    /* Nascondi colonne meno importanti su mobile */
+    tbody tr td:nth-child(3),
+    thead tr th:nth-child(3),
+    tbody tr td:nth-child(7),
+    thead tr th:nth-child(7) {
+      display: none;
+    }
+  }
+
+  /* Indicatori di stato colorati */
+  .state-READY {
+    color: #58a6ff;
+  }
+  .state-RUNNING {
+    color: #3fb950;
+  }
+  .state-BLOCKED {
+    color: #f85149;
+  }
+  .state-TERMINATED {
+    color: #8b949e;
+  }
+</style>
+```
+
   </head>
   <body>
-    <h1>Browser Virtual Kernel</h1>
-    <small>Kernel JS avanzato: processi, VFS, porte, shell – tutto nel browser.</small>
+    <div class="container">
+      <h1>🖥️ Browser Virtual Kernel</h1>
+      <small>
+        Advanced JS kernel: processes, VFS, ports, shell – all in the browser.
+      </small>
 
-    <h2>Controlli</h2>
-    <div>
-      <button id="btnAuto">Start/stop kernel</button>
-      <button id="btnSpawnEchoClient">Spawn echo-client</button>
+```
+  <div class="controls">
+    <button id="btnAuto">Start kernel</button>
+    <button id="btnSpawnEchoClient">Spawn echo-client</button>
+  </div>
+
+  <h2>💬 Shell</h2>
+  <div class="shell">
+    <div id="shellHistory" class="shell-history"></div>
+    <div class="shell-input-wrapper">
+      <span class="shell-prompt">$</span>
+      <input
+        id="shellInput"
+        class="shell-input"
+        autocomplete="off"
+        placeholder="e.g. echo-client 8080 hello"
+      />
     </div>
+  </div>
+  <p class="help-text">
+    Commands are sent to the kernel shell on port 9999. Results appear in
+    the kernel log below.<br />
+    Built-in: <code>echo-client</code>, <code>echo-server</code>,
+    <code>ps</code>, <code>ls</code>, <code>netstat</code>.
+  </p>
 
-    <h2>Shell</h2>
-    <div class="shell">
-      <div id="shellHistory" class="shell-history"></div>
-      <div>
-        <span>$ </span>
-        <input
-          id="shellInput"
-          class="shell-input"
-          autocomplete="off"
-          placeholder="es: echo-client 8080 ciao"
-        />
-      </div>
-    </div>
-    <p style="font-size: 12px; margin-top: 4px;">
-      I comandi vengono inviati alla shell del kernel sulla porta 9999.<br />
-      I risultati compaiono nei log in basso.
-    </p>
+  <div class="grid">
+    <section>
+      <h2>⚙️ Processes</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>PID</th>
+            <th>Name</th>
+            <th>Prio</th>
+            <th>State</th>
+            <th>Block</th>
+            <th>Exit</th>
+            <th>Age (s)</th>
+          </tr>
+        </thead>
+        <tbody id="processTableBody"></tbody>
+      </table>
+    </section>
 
-    <div class="grid">
-      <section>
-        <h2>Processi</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>PID</th>
-              <th>Nome</th>
-              <th>Priorità</th>
-              <th>Stato</th>
-              <th>Blocco</th>
-              <th>Exit</th>
-              <th>Età (s)</th>
-            </tr>
-          </thead>
-          <tbody id="processTableBody"></tbody>
-        </table>
-      </section>
+    <section>
+      <h2>🌐 Ports</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Port</th>
+            <th>Owner PID</th>
+            <th>Queue</th>
+          </tr>
+        </thead>
+        <tbody id="portsTableBody"></tbody>
+      </table>
 
-      <section>
-        <h2>Porte</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>Port</th>
-              <th>Owner PID</th>
-              <th>Queue</th>
-            </tr>
-          </thead>
-          <tbody id="portsTableBody"></tbody>
-        </table>
+      <h2>📁 VFS</h2>
+      <ul id="vfsList"></ul>
+    </section>
+  </div>
 
-        <h2>VFS</h2>
-        <ul id="vfsList"></ul>
-      </section>
-    </div>
+  <h2>📋 Kernel log</h2>
+  <pre id="logArea"></pre>
+</div>
 
-    <h2>Log kernel</h2>
-    <pre id="logArea"></pre>
+<script type="module" src="./main.js"></script>
+```
 
-    <script type="module" src="./main.js"></script>
   </body>
 </html>
