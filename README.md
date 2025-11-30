@@ -1,5 +1,4 @@
-Perfetto, allora aggiorniamo il README con il link reale.
-Puoi incollare questo in README.md:
+
 
 # Browser-virtual-kernel
 
