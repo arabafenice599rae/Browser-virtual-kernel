@@ -62,16 +62,5 @@ https://arabafenice599rae.github.io/Browser-virtual-kernel/
 2. Click **“Start Kernel”**.
 3. Type commands into the shell (see list below).
 
-### Local
-
-You just need a static file server (because ES modules):
-
-
-# from the repo root
-python -m http.server 8000
-# or any other static server
-
-# then open:
-http://localhost:8000/
 
 
