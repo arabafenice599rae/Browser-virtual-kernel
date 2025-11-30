@@ -4,18 +4,24 @@ import {
   echoServer,
   echoClient,
   shellProcess,
+  psProgram,
+  lsProgram,
+  netstatProgram,
 } from "./kernel.js";
 
-// ---------- BOOT DEL KERNEL ----------
+// ---------- Kernel boot ----------
 
 const kernel = new Kernel({ tickMs: 50 });
 
-// registra i programmi userland
+// register programs
 kernel.registerProgram("echo-server", echoServer);
 kernel.registerProgram("echo-client", echoClient);
 kernel.registerProgram("shell", shellProcess);
+kernel.registerProgram("ps", psProgram);
+kernel.registerProgram("ls", lsProgram);
+kernel.registerProgram("netstat", netstatProgram);
 
-// avvia shell (porta 9999) e echo server (porta 8080)
+// start shell (port 9999) and echo server on 8080
 kernel.spawn(shellProcess, {
   name: "shell",
   priority: 2,
@@ -25,10 +31,10 @@ kernel.spawn((sys) => echoServer(sys, 8080), {
   priority: 2,
 });
 
-// esportiamo per debug da console
+// export for debug
 window.kernel = kernel;
 
-// ---------- UI: riferimenti DOM ----------
+// ---------- DOM refs ----------
 
 const processTableBody = document.getElementById("processTableBody");
 const portsTableBody = document.getElementById("portsTableBody");
@@ -43,7 +49,7 @@ const shellInputEl = document.getElementById("shellInput");
 
 let autoId = null;
 
-// ---------- Funzioni di render ----------
+// ---------- Render helpers ----------
 
 function renderProcesses() {
   const procs = kernel.getProcessTable();
@@ -96,7 +102,6 @@ function renderLogs() {
     .join("\n");
 }
 
-// shell UI history
 function appendShellHistory(line) {
   const div = document.createElement("div");
   div.textContent = line;
@@ -104,7 +109,7 @@ function appendShellHistory(line) {
   shellHistoryEl.scrollTop = shellHistoryEl.scrollHeight;
 }
 
-// ---------- Kernel tick + UI refresh ----------
+// ---------- Kernel tick ----------
 
 function oneTick() {
   kernel.tick();
@@ -115,29 +120,26 @@ function oneTick() {
   renderLogs();
 }
 
-// ---------- Programma: shell-client per un comando ----------
+// ---------- Shell client program ----------
 
 function makeShellClientProgram(line) {
   return function* shellClient(sys) {
     const myPid = yield sys.getPid();
-    yield sys.log(`Shell client ${myPid}: comando "${line}"`);
-
-    // manda alla shell (porta 9999)
+    yield sys.log(`Shell client ${myPid}: command "${line}"`);
     yield sys.sendToPort(9999, { command: line, from: myPid });
 
-    // aspetta risposta via IPC
     const reply = yield sys.recv();
     if (reply && reply.payload && reply.payload.type === "SHELL_RESULT") {
       const out = reply.payload.output;
       yield sys.log(`Shell result: ${out}`);
     } else {
-      yield sys.log("Shell result: nessuna risposta");
+      yield sys.log("Shell result: no reply");
     }
     yield sys.exit(0);
   };
 }
 
-// ---------- Eventi UI ----------
+// ---------- UI events ----------
 
 btnAuto.onclick = () => {
   if (autoId === null) {
@@ -151,7 +153,6 @@ btnAuto.onclick = () => {
 };
 
 btnSpawnEchoClient.onclick = () => {
-  // client demo: echo-client 8080 "hello-ui"
   kernel.spawn((sys) => echoClient(sys, 8080, "hello-from-ui"), {
     name: "echo-client",
     priority: 1,
@@ -176,10 +177,12 @@ shellInputEl.addEventListener("keydown", (e) => {
   }
 });
 
-// ---------- Primo render ----------
+// ---------- Initial render ----------
 
 renderProcesses();
 renderPorts();
 renderVFS();
 renderLogs();
-appendShellHistory("Shell pronta. Esempio: echo-client 8080 ciao");
+appendShellHistory(
+  "Shell ready. Example: echo-client 8080 hello, ps, ls, netstat"
+);
